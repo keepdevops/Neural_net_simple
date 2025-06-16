@@ -502,7 +502,7 @@ if __name__ == "__main__":
     metadata = {
         'timestamp': timestamp,
         'input_size': 5,
-        'hidden_size': 16,
+        'hidden_size': 4,
         'output_size': 1,
         'learning_rate': 0.001,
         'batch_size': 32,
@@ -619,4 +619,4 @@ if __name__ == "__main__":
     
     print(f"\nModel training complete. Model files and plots saved in directory: {model_dir}")
     print("Use predict.py to make predictions on new data.")
-    print("Example: python predict.py gamestop_us.csv --model_dir", model_dir)
+    print("Example: python predict.py /Users/porupine/redline/data/gamestop_us.csv --model_dir", model_dir)

@@ -58,7 +58,7 @@ class StockPredictionGUI:
         training_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
         
         ttk.Label(training_frame, text="Hidden Layer Size:").grid(row=0, column=0, sticky="w")
-        self.hidden_size_var = tk.StringVar(value="16")
+        self.hidden_size_var = tk.StringVar(value="4")
         ttk.Entry(training_frame, textvariable=self.hidden_size_var, width=10).grid(row=0, column=1, padx=5)
         
         ttk.Label(training_frame, text="Learning Rate:").grid(row=1, column=0, sticky="w")
