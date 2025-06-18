@@ -28,7 +28,6 @@ import tempfile
 import threading
 import importlib.util
 import time
-import traceback
 
 # Import stock_net module
 try:
@@ -159,7 +158,7 @@ class StockPredictionGUI:
         # Initialize variables
         self.data_file = None
         self.data_file_var = tk.StringVar()  # Variable for data file entry
-        self.current_model_dir = "models"
+        self.current_model_dir = "."
         self.selected_model_path = None  # Track the currently selected model path
         self.x_features = []
         self.y_feature = ""
@@ -178,6 +177,7 @@ class StockPredictionGUI:
         self.hidden_size_var = tk.StringVar(value="4")  # Default hidden layer size
         self.learning_rate_var = tk.StringVar(value="0.001")  # Default learning rate
         self.batch_size_var = tk.StringVar(value="32")  # Default batch size
+        self.patience_var = tk.StringVar(value="20")
         
         # Gradient descent visualization parameters
         self.color_var = tk.StringVar(value="red")
@@ -264,9 +264,9 @@ class StockPredictionGUI:
         gd_frame.grid_columnconfigure(0, weight=1)
         gd_frame.grid_rowconfigure(0, weight=1)
         
-        # Create matplotlib figure for gradient descent visualization
+        # Create matplotlib figure for gradient descent visualization (2D to avoid matplotlib issues)
         self.gd_fig = plt.Figure(figsize=(8, 6))
-        self.gd_ax = self.gd_fig.add_subplot(111, projection='3d')
+        self.gd_ax = self.gd_fig.add_subplot(111)  # Remove 3D projection
         
         # Create canvas and embed in the tab
         self.gd_canvas = FigureCanvasTkAgg(self.gd_fig, gd_frame)
@@ -277,10 +277,10 @@ class StockPredictionGUI:
         toolbar.update()
         
         # Initialize with a placeholder plot
-        self.gd_ax.text(0.5, 0.5, 0.5, 'Training visualization will appear here', 
+        self.gd_ax.text(0.5, 0.5, 'Training visualization will appear here', 
                        ha='center', va='center', transform=self.gd_ax.transAxes,
                        fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
-        self.gd_ax.set_title("3D Gradient Descent Visualization")
+        self.gd_ax.set_title("Live Training Progress")
         self.gd_canvas.draw()
         
         print("Gradient Descent tab created successfully")
@@ -309,6 +309,33 @@ class StockPredictionGUI:
                           fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
         self.plots_ax.set_title("Model Plots")
         self.plots_canvas.draw()
+        
+        # 3D Gradient Descent Tab
+        gd3d_frame = ttk.Frame(self.display_notebook)
+        self.display_notebook.add(gd3d_frame, text="3D Gradient Descent")
+        gd3d_frame.grid_columnconfigure(0, weight=1)
+        gd3d_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create matplotlib figure for 3D gradient descent visualization
+        self.gd3d_fig = plt.Figure(figsize=(8, 6))
+        self.gd3d_ax = self.gd3d_fig.add_subplot(111, projection='3d')
+        
+        # Create canvas and embed in the tab
+        self.gd3d_canvas = FigureCanvasTkAgg(self.gd3d_fig, gd3d_frame)
+        self.gd3d_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        
+        # Add toolbar
+        toolbar = NavigationToolbar2Tk(self.gd3d_canvas, gd3d_frame)
+        toolbar.update()
+        
+        # Initialize with a placeholder plot
+        self.gd3d_ax.text(0.5, 0.5, 0.5, '3D Gradient Descent visualization will appear here after training', 
+                          ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                          fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
+        self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+        self.gd3d_canvas.draw()
+        
+        print("3D Gradient Descent tab created successfully")
         
         print(f"Display panel created with {self.display_notebook.index('end')} tabs")
 
@@ -342,32 +369,45 @@ class StockPredictionGUI:
             self.load_features()
 
     def load_features(self):
-        """Load features from the selected data file."""
+        """Load features from the selected data file"""
         try:
-            # Clear existing features
-            self.x_features_listbox.delete(0, tk.END)
-            self.y_features_combo['values'] = []
-            self.y_features_combo.set("")
+            if not self.data_file:
+                messagebox.showerror("Error", "Please select a data file first")
+                return
             
-            # Load features from CSV file
+            # Load the CSV file using the full path stored in self.data_file
             df = pd.read_csv(self.data_file)
             
-            # Clean column names - remove empty strings and whitespace
-            df.columns = [col.strip() if isinstance(col, str) else str(col) for col in df.columns]
-            df.columns = [col for col in df.columns if col]  # Remove empty strings
+            if df.empty:
+                messagebox.showerror("Error", "The selected file is empty")
+                self.status_var.set("Error: Empty file")
+                return
             
-            # Define which columns are numeric and which are text
-            numeric_columns = ['open', 'high', 'low', 'close', 'vol', 'openint']
-            text_columns = ['ticker', 'timestamp', 'format']
+            # Define expected column types
+            expected_numeric_columns = ['open', 'high', 'low', 'close', 'vol', 'openint']
+            expected_text_columns = ['ticker', 'timestamp', 'format']
             
-            # Convert only numeric columns to float
-            for col in numeric_columns:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            # Do not convert text columns
+            # Find which columns actually exist in the dataframe
+            existing_numeric_columns = [col for col in expected_numeric_columns if col in df.columns]
+            existing_text_columns = [col for col in expected_text_columns if col in df.columns]
             
-            # Only drop rows with NaN in numeric columns
-            df = df.dropna(subset=numeric_columns)
+            # Log what columns were found
+            print(f"Found numeric columns: {existing_numeric_columns}")
+            print(f"Found text columns: {existing_text_columns}")
+            print(f"All columns in file: {list(df.columns)}")
+            
+            # Convert only existing numeric columns to float
+            for col in existing_numeric_columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            # Only drop rows with NaN in existing numeric columns (if any exist)
+            if existing_numeric_columns:
+                initial_rows = len(df)
+                df = df.dropna(subset=existing_numeric_columns)
+                final_rows = len(df)
+                print(f"Dropped {initial_rows - final_rows} rows with NaN values in numeric columns")
+            else:
+                print("No numeric columns found, skipping NaN removal")
             
             if df.empty:
                 messagebox.showerror("Error", "No valid numeric data found in the file")
@@ -388,6 +428,11 @@ class StockPredictionGUI:
                 self.status_var.set("Error: No valid features")
                 return
             
+            # Clear existing features from UI
+            self.x_features_listbox.delete(0, tk.END)
+            self.y_features_combo['values'] = []
+            self.y_features_combo.set("")
+            
             # Update X features listbox
             for feature in self.feature_list:
                 self.x_features_listbox.insert(tk.END, feature)
@@ -406,8 +451,8 @@ class StockPredictionGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load features: {str(e)}")
             self.status_var.set(f"Error: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            print("Error occurred")
+            print(f"Error: {e}")
 
     def validate_features(self):
         """Validate the selected features"""
@@ -541,9 +586,11 @@ class StockPredictionGUI:
         ttk.Entry(train_frame, textvariable=self.learning_rate_var).grid(row=3, column=0, sticky="ew", pady=2)
         ttk.Label(train_frame, text="Batch Size:").grid(row=4, column=0, sticky="ew", pady=2)
         ttk.Entry(train_frame, textvariable=self.batch_size_var).grid(row=5, column=0, sticky="ew", pady=2)
-        ttk.Label(train_frame, text="Training Progress:").grid(row=6, column=0, sticky="ew", pady=2)
+        ttk.Label(train_frame, text="Patience Epoch:").grid(row=6, column=0, sticky="ew", pady=2)
+        ttk.Entry(train_frame, textvariable=self.patience_var).grid(row=7, column=0, sticky="ew", pady=2)
+        ttk.Label(train_frame, text="Training Progress:").grid(row=8, column=0, sticky="ew", pady=2)
         progress_frame = ttk.Frame(train_frame)
-        progress_frame.grid(row=7, column=0, sticky="nsew", pady=2)
+        progress_frame.grid(row=9, column=0, sticky="nsew", pady=2)
         progress_frame.grid_columnconfigure(0, weight=1)
         progress_frame.grid_rowconfigure(0, weight=1)
         self.progress_text = tk.Text(progress_frame, height=10, wrap=tk.WORD)
@@ -884,47 +931,49 @@ class StockPredictionGUI:
         else:
             messagebox.showwarning("Warning", "Please select a valid prediction file")
 
-    def view_results(self):
-        """View prediction results"""
-        # Find the most recent prediction file
-        prediction_files = glob.glob("predictions_*.csv")
-        if not prediction_files:
-            messagebox.showwarning("Warning", "No prediction files found")
-            return
-            
-        # Get the most recent file
-        latest_prediction = max(prediction_files, key=os.path.getctime)
-        
+    def display_predictions(self, pred_file):
+        """Display prediction results in the prediction results tab"""
         try:
-            # Load and display predictions
-            df = pd.read_csv(latest_prediction)
+            # Load predictions
+            df = pd.read_csv(pred_file)
+            ticker = self.get_ticker_from_filename()
+            
+            # Get current model name for display
+            current_model = os.path.basename(self.selected_model_path) if self.selected_model_path else "Unknown Model"
             
             # Display in the prediction results tab
             self.pred_ax.clear()
             
             if 'actual' in df.columns and 'predicted' in df.columns:
                 # Plot actual vs predicted
-                self.pred_ax.plot(df['actual'], label='Actual', alpha=0.7)
-                self.pred_ax.plot(df['predicted'], label='Predicted', alpha=0.7)
-                self.pred_ax.set_title("Actual vs Predicted Values")
-                self.pred_ax.set_xlabel("Sample")
-                self.pred_ax.set_ylabel("Value")
+                self.pred_ax.plot(df['actual'], label='Actual', alpha=0.7, linewidth=2)
+                self.pred_ax.plot(df['predicted'], label='Predicted', alpha=0.7, linewidth=2)
+                self.pred_ax.set_title(f"Actual vs Predicted Values ({ticker})\nModel: {current_model}")
+                self.pred_ax.set_xlabel("Data Point")
+                self.pred_ax.set_ylabel("Price")
                 self.pred_ax.legend()
+                
+                # Add correlation info
+                correlation = np.corrcoef(df['actual'], df['predicted'])[0, 1]
+                self.pred_ax.text(0.02, 0.98, f'Correlation: {correlation:.3f}', 
+                                transform=self.pred_ax.transAxes, 
+                                verticalalignment='top',
+                                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
             else:
                 # Plot predictions only
-                self.pred_ax.plot(df.iloc[:, -1], label='Predictions')
-                self.pred_ax.set_title("Predictions")
-                self.pred_ax.set_xlabel("Sample")
-                self.pred_ax.set_ylabel("Value")
+                self.pred_ax.plot(df.iloc[:, -1], label='Predictions', linewidth=2)
+                self.pred_ax.set_title(f"Predictions ({ticker})\nModel: {current_model}")
+                self.pred_ax.set_xlabel("Data Point")
+                self.pred_ax.set_ylabel("Price")
                 self.pred_ax.legend()
             
-            self.pred_ax.grid(True)
+            self.pred_ax.grid(True, alpha=0.3)
             self.pred_canvas.draw()
             
             # Switch to prediction results tab (index 1)
             self.switch_to_tab(1)
             
-            self.status_var.set(f"Displaying results from {latest_prediction}")
+            self.status_var.set(f"Displaying results from {pred_file} using model: {current_model}")
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to display results: {str(e)}")
@@ -963,12 +1012,39 @@ class StockPredictionGUI:
             print(f"Training results updated with {len(losses)} epochs")
         except Exception as e:
             print(f"Error updating training results: {e}")
-            import traceback
-            traceback.print_exc()
+            print("Error occurred")
+            print(f"Error: {e}")
+
+    def get_ticker_from_filename(self):
+        """Extract ticker symbol from the data file name"""
+        try:
+            if not self.data_file:
+                return ""
+            filename = os.path.basename(self.data_file)
+            if "_us_data.csv" in filename:
+                ticker = filename.split("_us_data.csv")[0].upper()
+                return ticker
+            elif "_data.csv" in filename:
+                ticker = filename.split("_data.csv")[0].upper()
+                return ticker
+            else:
+                import re
+                match = re.match(r"^([A-Z]+)", filename.upper())
+                if match:
+                    return match.group(1)
+                return ""
+        except Exception as e:
+            print(f"Error extracting ticker: {e}")
+            return ""
 
     def update_live_plot(self, epochs, losses):
-        """Update the live plot with training progress and 3D gradient descent visualization"""
+        """Update the live plot with training progress (2D only to avoid matplotlib 3D issues)"""
         try:
+            # Check if GUI is still active
+            if not hasattr(self, 'root') or not self.root or not self.root.winfo_exists():
+                return
+                
+            ticker = self.get_ticker_from_filename()
             # Ensure epochs and losses have the same length
             if len(epochs) != len(losses):
                 min_length = min(len(epochs), len(losses))
@@ -979,83 +1055,51 @@ class StockPredictionGUI:
                 epochs_plot = epochs
                 losses_plot = losses
             
+            if len(epochs_plot) == 0:
+                return
+            
             # Clear the plot
             self.gd_ax.clear()
             
-            if len(epochs_plot) > 0:
-                # Create 3D gradient descent visualization
-                if len(epochs_plot) >= 3:  # Need at least 3 points for 3D
-                    # Create a 3D surface representing the loss landscape
-                    x = np.linspace(-2, 2, 50)
-                    y = np.linspace(-2, 2, 50)
-                    X, Y = np.meshgrid(x, y)
-                    
-                    # Create a bowl-shaped loss surface
-                    Z = X**2 + Y**2 + 0.1 * np.sin(3*X) * np.cos(3*Y)
-                    
-                    # Plot the 3D surface
-                    self.gd_ax.plot_surface(X, Y, Z, alpha=0.3, cmap='viridis')
-                    
-                    # Create spiral trajectory representing weight updates
-                    t = np.linspace(0, 4*np.pi, len(epochs_plot))
-                    spiral_x = 1.5 * np.exp(-0.3*t) * np.cos(t)
-                    spiral_y = 1.5 * np.exp(-0.3*t) * np.sin(t)
-                    spiral_z = spiral_x**2 + spiral_y**2 + 0.1 * np.sin(3*spiral_x) * np.cos(3*spiral_y)
-                    
-                    # Plot the spiral trajectory
-                    self.gd_ax.plot(spiral_x, spiral_y, spiral_z, 'r-', linewidth=3, label='Training Path')
-                    
-                    # Mark current position
-                    if len(epochs_plot) > 0:
-                        current_x = spiral_x[-1]
-                        current_y = spiral_y[-1]
-                        current_z = spiral_z[-1]
-                        self.gd_ax.scatter([current_x], [current_y], [current_z], 
-                                         color='red', s=100, marker='o', label='Current Position')
-                    
-                    # Set labels and title
-                    self.gd_ax.set_xlabel('Weight 1')
-                    self.gd_ax.set_ylabel('Weight 2')
-                    self.gd_ax.set_zlabel('Loss')
-                    self.gd_ax.set_title(f'3D Gradient Descent Visualization\nEpoch {epochs_plot[-1]}, Loss: {losses_plot[-1]:.6f}')
-                    
-                else:
-                    # Fallback to 2D plot for early epochs
-                    self.gd_ax.plot(epochs_plot, losses_plot, 'r-', linewidth=2, label='Training Loss')
-                    self.gd_ax.set_title("Live Training Progress (2D)")
-                    self.gd_ax.set_xlabel("Epoch")
-                    self.gd_ax.set_ylabel("MSE Loss")
-                    self.gd_ax.legend()
-                    self.gd_ax.grid(True, alpha=0.3)
-                
-                # Add current loss value as text
-                if losses_plot:
-                    current_loss = losses_plot[-1]
-                    if len(epochs_plot) >= 3:
-                        # For 3D plot, add text annotation
-                        self.gd_ax.text2D(0.02, 0.98, f'Current Loss: {current_loss:.6f}', 
-                                        transform=self.gd_ax.transAxes, 
-                                        verticalalignment='top',
-                                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-                    else:
-                        # For 2D plot, add text annotation
-                        self.gd_ax.text(0.02, 0.98, f'Current Loss: {current_loss:.6f}', 
-                                      transform=self.gd_ax.transAxes, 
-                                      verticalalignment='top',
-                                      bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            # Simple 2D plot to avoid matplotlib 3D issues
+            self.gd_ax.plot(epochs_plot, losses_plot, 'r-', linewidth=2, label='Training Loss')
+            self.gd_ax.set_title(f"Live Training Progress - {ticker} (Epoch {epochs_plot[-1]})")
+            self.gd_ax.set_xlabel("Epoch")
+            self.gd_ax.set_ylabel("MSE Loss")
+            self.gd_ax.legend()
+            self.gd_ax.grid(True, alpha=0.3)
             
-            self.gd_canvas.draw()
-            self.gd_canvas.flush_events()
+            # Add current loss value as text
+            if losses_plot:
+                current_loss = losses_plot[-1]
+                self.gd_ax.text(0.02, 0.98, f'Current Loss: {current_loss:.6f}', 
+                              transform=self.gd_ax.transAxes, 
+                              verticalalignment='top',
+                              bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+            
+            # Use a try-catch for the canvas draw to handle any remaining matplotlib issues
+            try:
+                self.gd_canvas.draw()
+                self.gd_canvas.flush_events()
+            except Exception as draw_error:
+                print(f"Canvas draw error (non-critical): {draw_error}")
+            
             print(f"Live plot updated with {len(epochs_plot)} epochs")
+            
         except Exception as e:
             print(f"Error updating live plot: {e}")
-            import traceback
-            traceback.print_exc()
+            # Don't print additional error messages to avoid recursion
 
     def update_progress(self, message):
         """Update the progress text widget with a message"""
         try:
-            if hasattr(self, 'progress_text'):
+            # Check if the GUI is still active and progress_text exists
+            if (hasattr(self, 'progress_text') and 
+                self.progress_text and 
+                hasattr(self, 'root') and 
+                self.root and 
+                self.root.winfo_exists()):
+                
                 # Enable the text widget for writing
                 self.progress_text.configure(state="normal")
                 
@@ -1075,8 +1119,8 @@ class StockPredictionGUI:
                 
             print(f"Progress: {message}")
         except Exception as e:
-            print(f"Error updating progress: {e}")
-            traceback.print_exc()
+            # Use a simple print to avoid recursion
+            print(f"Error updating progress: {str(e)}")
 
     def browse_model_dir(self):
         """Open directory dialog to select model directory"""
@@ -1096,6 +1140,7 @@ class StockPredictionGUI:
             hidden_size = int(self.hidden_size_var.get())
             learning_rate = float(self.learning_rate_var.get())
             batch_size = int(self.batch_size_var.get())
+            patience = int(self.patience_var.get())
             
             # Get selected features - handle both locked and unlocked states
             if self.features_locked and hasattr(self, 'locked_features') and self.locked_features:
@@ -1113,7 +1158,7 @@ class StockPredictionGUI:
                 print(f"Using selected features: {self.x_features}")
             
             self.y_feature = self.y_features_combo.get()
-            if not self.y_feature:
+            if not self.y_feature or self.y_feature.strip() == "":
                 messagebox.showerror("Error", "Please select a target feature")
                 return
             
@@ -1144,6 +1189,7 @@ class StockPredictionGUI:
             print(f"Hidden Size: {hidden_size}")
             print(f"Learning Rate: {learning_rate}")
             print(f"Batch Size: {batch_size}")
+            print(f"Patience Epoch: {patience}")
             print(f"Features Locked: {self.features_locked}")
             
             # Switch to gradient descent tab for live visualization
@@ -1162,7 +1208,7 @@ class StockPredictionGUI:
             import threading
             training_thread = threading.Thread(
                 target=self._run_training_thread,
-                args=(hidden_size, learning_rate, batch_size),
+                args=(hidden_size, learning_rate, batch_size, patience),
                 daemon=True
             )
             training_thread.start()
@@ -1172,7 +1218,7 @@ class StockPredictionGUI:
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred: {str(e)}")
 
-    def _run_training_thread(self, hidden_size, learning_rate, batch_size):
+    def _run_training_thread(self, hidden_size, learning_rate, batch_size, patience):
         """Run training in a background thread with live updates"""
         try:
             # Import required modules for training
@@ -1234,7 +1280,6 @@ class StockPredictionGUI:
             epochs = 1000
             n_samples = X_train.shape[0]
             best_val_mse = float('inf')
-            patience = 20
             patience_counter = 0
             
             # Track training progress
@@ -1284,7 +1329,7 @@ class StockPredictionGUI:
                 
                 epochs_list.append(epoch + 1)
                 
-                # Update live plot every epoch
+                # Update live plot less frequently to prevent recursion
                 # Ensure arrays have the same length for plotting
                 plot_epochs = epochs_list.copy()
                 plot_losses = train_losses.copy()
@@ -1294,8 +1339,18 @@ class StockPredictionGUI:
                 plot_epochs = plot_epochs[:min_len]
                 plot_losses = plot_losses[:min_len]
                 
-                self.root.after(0, lambda e=plot_epochs, l=plot_losses: self.update_live_plot(e, l))
-                self.root.after(0, lambda: self.update_progress(f"Epoch {epoch+1}, Train MSE: {avg_train_mse:.6f}, Val MSE: {val_mse:.6f}"))
+                if min_len > 0 and epoch % 20 == 0:  # Update every 20 epochs instead of 5
+                    try:
+                        self.root.after(0, lambda e=plot_epochs, l=plot_losses: self.update_live_plot(e, l))
+                    except Exception as plot_error:
+                        print(f"Live plot update error: {plot_error}")
+                
+                # Update progress less frequently to avoid recursion issues
+                if epoch % 20 == 0 or epoch < 10:  # Update every 20 epochs or first 10 epochs
+                    try:
+                        self.root.after(0, lambda: self.update_progress(f"Epoch {epoch+1}, Train MSE: {avg_train_mse:.6f}, Val MSE: {val_mse:.6f}"))
+                    except Exception as progress_error:
+                        print(f"Progress update error: {progress_error}")
                 
                 # Early stopping
                 if val_mse < best_val_mse:
@@ -1334,8 +1389,8 @@ class StockPredictionGUI:
             
         except Exception as e:
             print(f"Training error: {e}")
-            import traceback
-            traceback.print_exc()
+            print("Error occurred")
+            print(f"Error: {e}")
             self.root.after(0, lambda: messagebox.showerror("Training Error", f"Training failed: {str(e)}"))
             self.root.after(0, self._enable_train_button)
 
@@ -1357,11 +1412,14 @@ class StockPredictionGUI:
             # Update plots tab
             self.update_plots_tab(train_losses, val_losses)
             
-            # Switch to training results tab
-            self.switch_to_tab(0)  # Training Results tab
+            # Create 3D gradient descent visualization
+            self.create_3d_gradient_descent_visualization(train_losses)
+            
+            # Switch to 3D gradient descent tab (index 4)
+            self.switch_to_tab(4)
             
             # Show success message
-            messagebox.showinfo("Success", f"Model training completed successfully!\nModel saved in: {model_dir}")
+            messagebox.showinfo("Success", f"Model training completed successfully!\nModel saved in: {model_dir}\n3D gradient descent visualization created!")
             
             # Set the newly created model as selected
             self.selected_model_path = model_dir
@@ -1375,47 +1433,11 @@ class StockPredictionGUI:
         self.train_button.config(state=tk.NORMAL)
         self.status_var.set("Ready")
 
-    def display_predictions(self, pred_file):
-        """Display prediction results in the prediction results tab"""
-        try:
-            # Load predictions
-            df = pd.read_csv(pred_file)
-            
-            # Display in the prediction results tab
-            self.pred_ax.clear()
-            
-            if 'actual' in df.columns and 'predicted' in df.columns:
-                # Plot actual vs predicted
-                self.pred_ax.plot(df['actual'], label='Actual', alpha=0.7)
-                self.pred_ax.plot(df['predicted'], label='Predicted', alpha=0.7)
-                self.pred_ax.set_title("Actual vs Predicted Values")
-                self.pred_ax.set_xlabel("Sample")
-                self.pred_ax.set_ylabel("Value")
-                self.pred_ax.legend()
-            else:
-                # Plot predictions only
-                self.pred_ax.plot(df.iloc[:, -1], label='Predictions')
-                self.pred_ax.set_title("Predictions")
-                self.pred_ax.set_xlabel("Sample")
-                self.pred_ax.set_ylabel("Value")
-                self.pred_ax.legend()
-            
-            self.pred_ax.grid(True)
-            self.pred_canvas.draw()
-            
-            # Switch to prediction results tab (index 1)
-            self.switch_to_tab(1)
-            
-            self.status_var.set(f"Displaying results from {pred_file}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to display results: {str(e)}")
-
     def update_plots_tab(self, train_losses, val_losses):
         """Update the plots tab with comprehensive training results"""
         try:
             self.plots_ax.clear()
-            
+            ticker = self.get_ticker_from_filename()
             epochs = list(range(1, len(train_losses) + 1))
             
             # Plot training and validation losses
@@ -1430,7 +1452,7 @@ class StockPredictionGUI:
                 ma_epochs = epochs[window-1:]
                 self.plots_ax.plot(ma_epochs, train_ma, 'g--', linewidth=1, label=f'Training MA ({window})', alpha=0.6)
             
-            self.plots_ax.set_title("Training Progress Overview")
+            self.plots_ax.set_title(f"Training Progress Overview ({ticker})")
             self.plots_ax.set_xlabel("Epoch")
             self.plots_ax.set_ylabel("MSE Loss")
             self.plots_ax.legend()
@@ -1450,7 +1472,82 @@ class StockPredictionGUI:
             
         except Exception as e:
             print(f"Error updating plots tab: {e}")
-            traceback.print_exc()
+            print(f"Error: {e}")
+
+    def create_3d_gradient_descent_visualization(self, train_losses):
+        """Create 3D gradient descent visualization with animation"""
+        try:
+            ticker = self.get_ticker_from_filename()
+            
+            # Clear the 3D plot
+            self.gd3d_ax.clear()
+            
+            if len(train_losses) < 3:
+                self.gd3d_ax.text(0.5, 0.5, 0.5, 'Need at least 3 epochs for 3D visualization', 
+                                 ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                                 fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+                self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+                self.gd3d_canvas.draw()
+                return
+            
+            # Create 3D surface representing the loss landscape
+            x = np.linspace(-2, 2, 50)
+            y = np.linspace(-2, 2, 50)
+            X, Y = np.meshgrid(x, y)
+            
+            # Create a bowl-shaped loss surface with some complexity
+            Z = X**2 + Y**2 + 0.1 * np.sin(3*X) * np.cos(3*Y)
+            
+            # Plot the 3D surface
+            self.gd3d_ax.plot_surface(X, Y, Z, alpha=0.3, cmap='viridis', edgecolor='none')
+            
+            # Create spiral trajectory representing weight updates during training
+            t = np.linspace(0, 4*np.pi, len(train_losses))
+            spiral_x = 1.5 * np.exp(-0.3*t) * np.cos(t)
+            spiral_y = 1.5 * np.exp(-0.3*t) * np.sin(t)
+            spiral_z = spiral_x**2 + spiral_y**2 + 0.1 * np.sin(3*spiral_x) * np.cos(3*spiral_y)
+            
+            # Plot the spiral trajectory
+            self.gd3d_ax.plot(spiral_x, spiral_y, spiral_z, 'r-', linewidth=3, label='Training Path')
+            
+            # Mark starting and ending positions
+            self.gd3d_ax.scatter([spiral_x[0]], [spiral_y[0]], [spiral_z[0]], 
+                               color='green', s=100, marker='o', label='Start')
+            self.gd3d_ax.scatter([spiral_x[-1]], [spiral_y[-1]], [spiral_z[-1]], 
+                               color='red', s=100, marker='o', label='End')
+            
+            # Add intermediate points for animation effect
+            for i in range(0, len(spiral_x), max(1, len(spiral_x)//20)):
+                self.gd3d_ax.scatter([spiral_x[i]], [spiral_y[i]], [spiral_z[i]], 
+                                   color='orange', s=50, marker='o', alpha=0.6)
+            
+            # Set labels and title
+            self.gd3d_ax.set_xlabel('Weight 1')
+            self.gd3d_ax.set_ylabel('Weight 2')
+            self.gd3d_ax.set_zlabel('Loss')
+            self.gd3d_ax.set_title(f'3D Gradient Descent Visualization ({ticker})\nEpochs: {len(train_losses)}')
+            
+            # Add legend
+            self.gd3d_ax.legend()
+            
+            # Set view angle for better visualization
+            self.gd3d_ax.view_init(elev=20, azim=45)
+            
+            # Draw the plot
+            self.gd3d_canvas.draw()
+            self.gd3d_canvas.flush_events()
+            
+            print(f"3D gradient descent visualization created with {len(train_losses)} epochs")
+            
+        except Exception as e:
+            print(f"Error creating 3D gradient descent visualization: {e}")
+            # Fallback to simple text if 3D plotting fails
+            self.gd3d_ax.clear()
+            self.gd3d_ax.text(0.5, 0.5, 0.5, f'3D visualization failed: {str(e)}', 
+                             ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                             fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+            self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+            self.gd3d_canvas.draw()
 
 def main():
     root = tk.Tk()
