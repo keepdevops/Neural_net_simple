@@ -12,21 +12,14 @@ Features:
 - Real-time weight and loss tracking
 
 Usage:
-    python gradient_descent_3d.py [options]
+    python gradient_descent_3d.py [model_dir]
 
-Options:
-    --model_dir MODEL_DIR    Directory containing model files (default: most recent)
-    --save_animation         Save animation as GIF (default: False)
-    --color COLOR            Path color (default: blue)
-    --point_size SIZE        Size of points (default: 50)
-    --line_width WIDTH       Width of path line (default: 2)
-    --surface_alpha ALPHA    Surface transparency (default: 0.6)
-    --n_points POINTS        Number of points in surface grid (default: 50)
-    --w1_range MIN MAX       Range for weight 1 (default: -2 2)
-    --w2_range MIN MAX       Range for weight 2 (default: -2 2)
-    --view_elev ELEV         Initial elevation angle (default: 30)
-    --view_azim AZIM         Initial azimuth angle (default: 45)
-    --fps FPS                Frames per second for animation (default: 30)
+Arguments:
+    model_dir    Path to the model directory (default: most recent model directory)
+
+Example:
+    python gradient_descent_3d.py
+    python gradient_descent_3d.py model_20240315_123456
 """
 
 import numpy as np
@@ -36,239 +29,201 @@ from mpl_toolkits.mplot3d import Axes3D
 import pandas as pd
 import os
 import glob
+import json
 from datetime import datetime
-import argparse
+import sys
+
+# Add project directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+def find_latest_model_dir():
+    """Find the most recent model directory."""
+    # Look for model directories in the current directory
+    model_dirs = glob.glob("model_*")
+    if not model_dirs:
+        # Also check in a 'models' subdirectory
+        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        if os.path.exists(models_dir):
+            model_dirs = glob.glob(os.path.join(models_dir, "model_*"))
+        
+        if not model_dirs:
+            raise FileNotFoundError("No model directories found. Please train a model first.")
+    
+    return max(model_dirs, key=os.path.getctime)
+
+def load_training_data(model_dir):
+    """Load training history and normalization parameters."""
+    # Ensure absolute path
+    model_dir = os.path.abspath(model_dir)
+    
+    # Load normalization parameters
+    norm_params_file = os.path.join(model_dir, "normalization.json")
+    if not os.path.exists(norm_params_file):
+        raise FileNotFoundError(f"Normalization parameters not found in {model_dir}")
+    
+    with open(norm_params_file, 'r') as f:
+        norm_params = json.load(f)
+    
+    # Load training history
+    history_file = os.path.join(model_dir, "training_history.json")
+    if not os.path.exists(history_file):
+        raise FileNotFoundError(f"Training history not found in {model_dir}")
+    
+    with open(history_file, 'r') as f:
+        history = json.load(f)
+    
+    return norm_params, history
+
+def compute_loss_surface(X, y, w1_range, w2_range, n_points=50):
+    """Compute the loss surface for visualization."""
+    w1 = np.linspace(w1_range[0], w1_range[1], n_points)
+    w2 = np.linspace(w2_range[0], w2_range[1], n_points)
+    W1, W2 = np.meshgrid(w1, w2)
+    
+    # Compute loss for each weight combination
+    Z = np.zeros_like(W1)
+    for i in range(n_points):
+        for j in range(n_points):
+            w = np.array([[W1[i, j]], [W2[i, j]]])
+            y_pred = X @ w
+            Z[i, j] = np.mean((y - y_pred) ** 2)
+    
+    return W1, W2, Z
 
 class GradientDescentVisualizer:
-    def __init__(self, model_dir=None, color='blue', point_size=50, line_width=2,
-                 surface_alpha=0.6, n_points=50, w1_range=(-2, 2), w2_range=(-2, 2),
+    def __init__(self, model_dir=None, w1_range=(-2, 2), w2_range=(-2, 2), n_points=50,
                  view_elev=30, view_azim=45, fps=30):
         """
         Initialize the gradient descent visualizer.
         
         Args:
             model_dir (str): Directory containing the model files
-            color (str): Color for the gradient descent path
-            point_size (int): Size of points in the path
-            line_width (int): Width of the path line
-            surface_alpha (float): Transparency of the surface
-            n_points (int): Number of points in surface grid
             w1_range (tuple): Range for weight 1
             w2_range (tuple): Range for weight 2
+            n_points (int): Number of points in surface grid
             view_elev (float): Initial elevation angle
             view_azim (float): Initial azimuth angle
             fps (int): Frames per second for animation
         """
-        self.model_dir = model_dir or self._find_latest_model_dir()
-        self.weights_history = []
-        self.losses = []
-        self.color = color
-        self.point_size = point_size
-        self.line_width = line_width
-        self.surface_alpha = surface_alpha
-        self.n_points = n_points
+        self.model_dir = model_dir or find_latest_model_dir()
         self.w1_range = w1_range
         self.w2_range = w2_range
+        self.n_points = n_points
         self.view_elev = view_elev
         self.view_azim = view_azim
         self.fps = fps
-        self.load_training_history()
         
-    def _find_latest_model_dir(self):
-        """Find the most recent model directory."""
-        model_dirs = glob.glob("model_*")
-        if not model_dirs:
-            raise FileNotFoundError("No model directories found")
-        return max(model_dirs, key=os.path.getctime)
-    
-    def load_training_history(self):
-        """Load training history from the model directory."""
-        # Load weights history if available
-        weights_files = glob.glob(os.path.join(self.model_dir, "weights_history_*.csv"))
-        if weights_files:
-            for file in sorted(weights_files):
-                weights = np.loadtxt(file, delimiter=',')
-                self.weights_history.append(weights)
+        # Load training data
+        self.norm_params, self.history = load_training_data(self.model_dir)
         
-        # Load losses if available
-        loss_file = os.path.join(self.model_dir, "training_losses.csv")
-        if os.path.exists(loss_file):
-            self.losses = np.loadtxt(loss_file, delimiter=',')
-    
-    def create_loss_surface(self, w1_range=(-2, 2), w2_range=(-2, 2), n_points=50):
-        """
-        Create a 3D surface of the loss function.
+        # Load the data used for training
+        data_file = os.path.join(self.model_dir, "training_data.csv")
+        if os.path.exists(data_file):
+            df = pd.read_csv(data_file)
+            X = df[self.norm_params['x_features']].values
+            y = df[self.norm_params['y_feature']].values.reshape(-1, 1)
+            self.X = X
+            self.y = y
+        else:
+            raise FileNotFoundError(f"Training data not found in {self.model_dir}")
         
-        Args:
-            w1_range (tuple): Range for first weight dimension
-            w2_range (tuple): Range for second weight dimension
-            n_points (int): Number of points in each dimension
-        """
-        # Create mesh grid
-        w1 = np.linspace(w1_range[0], w1_range[1], n_points)
-        w2 = np.linspace(w2_range[0], w2_range[1], n_points)
-        W1, W2 = np.meshgrid(w1, w2)
+        # Compute loss surface
+        self.W1, self.W2, self.Z = compute_loss_surface(X, y, w1_range, w2_range, n_points)
         
-        # Calculate loss for each point
-        Z = np.zeros_like(W1)
-        for i in range(n_points):
-            for j in range(n_points):
-                # Simplified loss function for visualization
-                Z[i, j] = W1[i, j]**2 + W2[i, j]**2
-        
-        return W1, W2, Z
-    
-    def plot_gradient_descent(self, save_animation=False):
-        """
-        Create and display the 3D gradient descent visualization.
-        
-        Args:
-            save_animation (bool): Whether to save the animation as a GIF
-        """
-        # Create figure and 3D axes
-        fig = plt.figure(figsize=(12, 8))
-        ax = fig.add_subplot(111, projection='3d')
-        
-        # Create loss surface
-        W1, W2, Z = self.create_loss_surface(
-            w1_range=self.w1_range,
-            w2_range=self.w2_range,
-            n_points=self.n_points
-        )
-        
-        # Plot the surface
-        surface = ax.plot_surface(W1, W2, Z, cmap='viridis', alpha=self.surface_alpha)
-        
-        # If we have weights history, plot the path
-        if self.weights_history:
-            weights = np.array(self.weights_history)
-            if weights.shape[1] >= 2:  # Ensure we have at least 2 weights to plot
-                # Plot the gradient descent path
-                path = ax.plot(weights[:, 0], weights[:, 1], 
-                             [w[0]**2 + w[1]**2 for w in weights],
-                             f'{self.color[0]}-', linewidth=self.line_width,
-                             label='Gradient Descent Path')
-                
-                # Add points for each step
-                scatter = ax.scatter(weights[:, 0], weights[:, 1],
-                                   [w[0]**2 + w[1]**2 for w in weights],
-                                   c=self.color, s=self.point_size)
-        
-        # Set labels and title
-        ax.set_xlabel('Weight 1')
-        ax.set_ylabel('Weight 2')
-        ax.set_zlabel('Loss')
-        ax.set_title('3D Gradient Descent Visualization')
-        
-        # Add colorbar
-        fig.colorbar(surface, ax=ax, shrink=0.5, aspect=5)
-        
-        # Add legend
-        if self.weights_history:
-            ax.legend()
+        # Initialize figure
+        self.fig = plt.figure(figsize=(12, 8))
+        self.ax = self.fig.add_subplot(111, projection='3d')
         
         # Set initial view
-        ax.view_init(elev=self.view_elev, azim=self.view_azim)
+        self.ax.view_init(elev=self.view_elev, azim=self.view_azim)
         
-        if save_animation:
-            # Create animation
-            def update(frame):
-                ax.view_init(elev=self.view_elev, azim=frame)
-                return fig,
-            
-            anim = animation.FuncAnimation(fig, update, frames=np.linspace(0, 360, 180),
-                                         interval=1000//self.fps, blit=True)
-            
-            # Save animation
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            anim.save(os.path.join(self.model_dir, f'gradient_descent_3d_{timestamp}.gif'),
-                     writer='pillow', fps=self.fps)
+        # Plot loss surface
+        self.surface = self.ax.plot_surface(self.W1, self.W2, self.Z, 
+                                          cmap='viridis', alpha=0.6)
         
-        plt.show()
+        # Plot gradient descent path
+        self.path = self.ax.plot([], [], [], 'r-', lw=2)[0]
+        self.current_point = self.ax.plot([], [], [], 'ro', markersize=8)[0]
+        
+        # Add labels
+        self.ax.set_xlabel('Weight 1')
+        self.ax.set_ylabel('Weight 2')
+        self.ax.set_zlabel('Loss')
+        
+        # Add title with model info
+        title_text = f"Gradient Descent Visualization\nModel: {os.path.basename(self.model_dir)}"
+        self.title = self.fig.suptitle(title_text, fontsize=14)
+        
+        # Add text annotation for current weights and loss
+        self.text = self.fig.text(0.02, 0.02, '', fontsize=10)
+        
+        # Initialize animation
+        self.animation = None
+        
+    def update(self, frame):
+        """Update the animation frame."""
+        if frame == 0:
+            # Clear path and start from beginning
+            self.path.set_data([], [])
+            self.path.set_3d_properties([])
+            self.current_point.set_data([], [])
+            self.current_point.set_3d_properties([])
+            
+            # Start from initial weights
+            w1 = self.history['weights'][0][0]
+            w2 = self.history['weights'][0][1]
+            loss = self.history['losses'][0]
+            
+            # Update text
+            self.text.set_text(f'Epoch: 0\nW1: {w1:.4f}\nW2: {w2:.4f}\nLoss: {loss:.4f}')
+            
+            return self.path, self.current_point, self.text
+        
+        # Get current weights and loss
+        w1 = self.history['weights'][frame][0]
+        w2 = self.history['weights'][frame][1]
+        loss = self.history['losses'][frame]
+        
+        # Update path
+        x_data = [w[0] for w in self.history['weights'][:frame+1]]
+        y_data = [w[1] for w in self.history['weights'][:frame+1]]
+        z_data = self.history['losses'][:frame+1]
+        
+        self.path.set_data(x_data, y_data)
+        self.path.set_3d_properties(z_data)
+        
+        # Update current point
+        self.current_point.set_data([w1], [w2])
+        self.current_point.set_3d_properties([loss])
+        
+        # Update text
+        self.text.set_text(f'Epoch: {frame}\nW1: {w1:.4f}\nW2: {w2:.4f}\nLoss: {loss:.4f}')
+        
+        return self.path, self.current_point, self.text
     
-    def plot_loss_curves(self):
-        """Plot the training and validation loss curves."""
-        if not self.losses.size:
-            print("No loss data available")
-            return
-        
-        plt.figure(figsize=(10, 6))
-        epochs = range(len(self.losses))
-        plt.plot(epochs, self.losses, 'b-', label='Training Loss')
-        plt.title('Training Loss Over Time')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.legend()
-        plt.grid(True)
-        
-        # Save the plot
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        plt.savefig(os.path.join(self.model_dir, f'loss_curves_{timestamp}.png'))
-        plt.show()
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='3D Gradient Descent Visualization')
-    parser.add_argument('--model_dir', type=str, help='Directory containing model files')
-    parser.add_argument('--save_animation', action='store_true', help='Save animation as GIF')
-    parser.add_argument('--color', type=str, default='blue', help='Path color')
-    parser.add_argument('--point_size', type=int, default=50, help='Size of points')
-    parser.add_argument('--line_width', type=int, default=2, help='Width of path line')
-    parser.add_argument('--surface_alpha', type=float, default=0.6, help='Surface transparency')
-    parser.add_argument('--n_points', type=int, default=50, help='Number of points in surface grid')
-    parser.add_argument('--w1_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 1')
-    parser.add_argument('--w2_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 2')
-    parser.add_argument('--view_elev', type=float, default=30, help='Initial elevation angle')
-    parser.add_argument('--view_azim', type=float, default=45, help='Initial azimuth angle')
-    parser.add_argument('--fps', type=int, default=30, help='Frames per second for animation')
-    return parser.parse_args()
-
-def main():
-    """Main function to run the visualization."""
-    try:
-        # Parse command line arguments
-        args = parse_args()
-        
-        # Create visualizer with specified options
-        visualizer = GradientDescentVisualizer(
-            model_dir=args.model_dir,
-            color=args.color,
-            point_size=args.point_size,
-            line_width=args.line_width,
-            surface_alpha=args.surface_alpha,
-            n_points=args.n_points,
-            w1_range=tuple(args.w1_range),
-            w2_range=tuple(args.w2_range),
-            view_elev=args.view_elev,
-            view_azim=args.view_azim,
-            fps=args.fps
+    def animate(self):
+        """Create and display the animation."""
+        self.animation = animation.FuncAnimation(
+            self.fig, self.update,
+            frames=len(self.history['losses']),
+            interval=1000/self.fps,
+            blit=True
         )
         
-        # Plot gradient descent in 3D
-        print("Creating 3D gradient descent visualization...")
-        visualizer.plot_gradient_descent(save_animation=args.save_animation)
-        
-        # Plot loss curves
-        print("Creating loss curves...")
-        visualizer.plot_loss_curves()
-        
+        plt.show()
+
+def main():
+    if len(sys.argv) > 1:
+        model_dir = sys.argv[1]
+    else:
+        model_dir = find_latest_model_dir()
+    
+    try:
+        visualizer = GradientDescentVisualizer(model_dir=model_dir)
+        visualizer.animate()
     except Exception as e:
-        print(f"Error: {str(e)}")
-        print("\nUsage:")
-        print("python gradient_descent_3d.py [options]")
-        print("\nOptions:")
-        print("  --model_dir MODEL_DIR    Directory containing model files (default: most recent)")
-        print("  --save_animation         Save animation as GIF (default: False)")
-        print("  --color COLOR            Path color (default: blue)")
-        print("  --point_size SIZE        Size of points (default: 50)")
-        print("  --line_width WIDTH       Width of path line (default: 2)")
-        print("  --surface_alpha ALPHA    Surface transparency (default: 0.6)")
-        print("  --n_points POINTS        Number of points in surface grid (default: 50)")
-        print("  --w1_range MIN MAX       Range for weight 1 (default: -2 2)")
-        print("  --w2_range MIN MAX       Range for weight 2 (default: -2 2)")
-        print("  --view_elev ELEV         Initial elevation angle (default: 30)")
-        print("  --view_azim AZIM         Initial azimuth angle (default: 45)")
-        print("  --fps FPS                Frames per second for animation (default: 30)")
+        print(f"Error creating visualization: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

@@ -32,6 +32,8 @@ import os
 import glob
 from datetime import datetime
 import matplotlib.pyplot as plt
+import argparse
+import json
 
 def sigmoid(x):
     """
@@ -98,22 +100,129 @@ class StockNet:
             output_size (int): Number of output neurons
         """
         # Initialize weights using Xavier/Glorot initialization
-        # This helps prevent vanishing/exploding gradients
         self.W1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
         self.b1 = np.zeros((1, hidden_size))
         self.W2 = np.random.randn(hidden_size, output_size) * np.sqrt(2.0 / hidden_size)
         self.b2 = np.zeros((1, output_size))
         
         # Initialize momentum parameters
-        self.momentum = 0.9  # Momentum coefficient
-        self.v_W1 = np.zeros_like(self.W1)  # Velocity for W1
-        self.v_b1 = np.zeros_like(self.b1)  # Velocity for b1
-        self.v_W2 = np.zeros_like(self.W2)  # Velocity for W2
-        self.v_b2 = np.zeros_like(self.b2)  # Velocity for b2
+        self.momentum = 0.9
+        self.v_W1 = np.zeros_like(self.W1)
+        self.v_b1 = np.zeros_like(self.b1)
+        self.v_W2 = np.zeros_like(self.W2)
+        self.v_b2 = np.zeros_like(self.b2)
+        
+        # Initialize normalization parameters
+        self.X_min = None
+        self.X_max = None
+        self.Y_min = None
+        self.Y_max = None
+        self.has_target_norm = False
+
+    def normalize(self, X, Y=None):
+        """
+        Normalize input features and target values.
+        
+        Args:
+            X (numpy.ndarray): Input features
+            Y (numpy.ndarray, optional): Target values
+        
+        Returns:
+            tuple: Normalized X and Y (if provided)
+        """
+        if self.X_min is None or self.X_max is None:
+            # Initialize normalization parameters
+            self.X_min = X.min(axis=0)
+            self.X_max = X.max(axis=0)
+            # Add small epsilon to avoid division by zero
+            self.X_max = np.where(self.X_max == self.X_min, 
+                                 self.X_max + 1e-8, 
+                                 self.X_max)
+            
+        # Normalize X
+        X_norm = (X - self.X_min) / (self.X_max - self.X_min)
+        
+        if Y is not None:
+            if not self.has_target_norm:
+                self.Y_min = Y.min()
+                self.Y_max = Y.max()
+                self.has_target_norm = True
+            
+            # Normalize Y
+            Y_norm = (Y - self.Y_min) / (self.Y_max - self.Y_min)
+            return X_norm, Y_norm
+            
+        return X_norm
+
+    def denormalize(self, Y_norm):
+        """
+        Denormalize target values.
+        
+        Args:
+            Y_norm (numpy.ndarray): Normalized target values
+            
+        Returns:
+            numpy.ndarray: Denormalized target values
+        """
+        if self.has_target_norm:
+            return Y_norm * (self.Y_max - self.Y_min) + self.Y_min
+        return Y_norm
+
+    def save_weights(self, model_dir, prefix="stock_model"):
+        """
+        Save model weights and parameters to NPZ file.
+        
+        Args:
+            model_dir (str): Directory to save the model
+            prefix (str): Prefix for the saved files
+        """
+        os.makedirs(model_dir, exist_ok=True)
+        
+        # Save weights and normalization parameters
+        np.savez(os.path.join(model_dir, f'{prefix}.npz'),
+                 W1=self.W1, b1=self.b1,
+                 W2=self.W2, b2=self.b2,
+                 X_min=self.X_min,
+                 X_max=self.X_max,
+                 Y_min=self.Y_min,
+                 Y_max=self.Y_max,
+                 has_target_norm=self.has_target_norm,
+                 input_size=self.W1.shape[0],
+                 hidden_size=self.W1.shape[1])
+
+    @classmethod
+    def load_weights(cls, model_dir, prefix="stock_model"):
+        """
+        Load model weights and parameters from NPZ file.
+        
+        Args:
+            model_dir (str): Directory containing the model
+            prefix (str): Prefix of the saved files
+            
+        Returns:
+            StockNet: Initialized model with loaded weights
+        """
+        weights_file = os.path.join(model_dir, f'{prefix}.npz')
+        if not os.path.exists(weights_file):
+            raise FileNotFoundError(f"No model weights found in {model_dir}")
+            
+        with np.load(weights_file) as data:
+            model = cls(input_size=int(data['input_size']), hidden_size=int(data['hidden_size']))
+            model.W1 = data['W1']
+            model.b1 = data['b1']
+            model.W2 = data['W2']
+            model.b2 = data['b2']
+            model.X_min = data['X_min']
+            model.X_max = data['X_max']
+            model.Y_min = data['Y_min']
+            model.Y_max = data['Y_max']
+            model.has_target_norm = bool(data['has_target_norm'])
+        
+        return model
 
     def forward(self, X):
         """
-        Perform forward propagation through the network.
+        Forward pass through the network.
         
         Args:
             X (numpy.ndarray): Input data of shape (n_samples, n_features)
@@ -121,23 +230,25 @@ class StockNet:
         Returns:
             numpy.ndarray: Network output of shape (n_samples, 1)
         """
-        # Forward propagation through each layer
-        self.z1 = np.dot(X, self.W1) + self.b1  # Hidden layer linear transformation
-        self.a1 = sigmoid(self.z1)              # Hidden layer activation
-        self.z2 = np.dot(self.a1, self.W2) + self.b2  # Output layer linear transformation
-        return self.z2                          # Return output (no activation for regression)
+        # Store intermediate values for backward pass
+        self.z1 = np.dot(X, self.W1) + self.b1
+        self.a1 = sigmoid(self.z1)
+        self.z2 = np.dot(self.a1, self.W2) + self.b2
+        self.output = sigmoid(self.z2)
+        
+        return self.output
 
     def backward(self, X, y, output, learning_rate=0.001):
         """
-        Perform backward propagation and update weights using momentum.
+        Backward pass to update weights and biases.
         
         Args:
-            X (numpy.ndarray): Input data
-            y (numpy.ndarray): Target values
+            X (numpy.ndarray): Input data of shape (n_samples, n_features)
+            y (numpy.ndarray): Target values of shape (n_samples, 1)
             output (numpy.ndarray): Network output from forward pass
             learning_rate (float): Learning rate for weight updates
         """
-        m = X.shape[0]  # batch size
+        m = X.shape[0]  # Number of samples
         
         # Compute gradients for each layer
         self.error = y - output
@@ -150,17 +261,16 @@ class StockNet:
         dW1 = np.dot(X.T, self.delta1) / m
         db1 = np.sum(self.delta1, axis=0, keepdims=True) / m
 
-        # Update momentum
-        self.v_W2 = self.momentum * self.v_W2 + learning_rate * dW2
-        self.v_b2 = self.momentum * self.v_b2 + learning_rate * db2
+        # Update weights and biases with momentum
         self.v_W1 = self.momentum * self.v_W1 + learning_rate * dW1
         self.v_b1 = self.momentum * self.v_b1 + learning_rate * db1
+        self.v_W2 = self.momentum * self.v_W2 + learning_rate * dW2
+        self.v_b2 = self.momentum * self.v_b2 + learning_rate * db2
 
-        # Update weights with momentum
-        self.W2 += self.v_W2
-        self.b2 += self.v_b2
         self.W1 += self.v_W1
         self.b1 += self.v_b1
+        self.W2 += self.v_W2
+        self.b2 += self.v_b2
 
     def train(self, X, y, epochs=1000, learning_rate=0.001, batch_size=32):
         """
@@ -219,35 +329,6 @@ class StockNet:
             # Print progress
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}, MSE: {avg_mse:.6f}")
-
-    def save_weights(self, prefix='model'):
-        """
-        Save network weights and biases to CSV files.
-        
-        Args:
-            prefix (str): Prefix for the saved files
-        """
-        np.savetxt(f'{prefix}_W1.csv', self.W1, delimiter=',')
-        np.savetxt(f'{prefix}_b1.csv', self.b1, delimiter=',')
-        np.savetxt(f'{prefix}_W2.csv', self.W2, delimiter=',')
-        np.savetxt(f'{prefix}_b2.csv', self.b2, delimiter=',')
-
-    @staticmethod
-    def load_weights(prefix='model'):
-        """
-        Load network weights and biases from CSV files.
-        
-        Args:
-            prefix (str): Prefix of the saved files
-            
-        Returns:
-            tuple: (W1, b1, W2, b2) containing the loaded weights and biases
-        """
-        W1 = np.loadtxt(f'{prefix}_W1.csv', delimiter=',')
-        b1 = np.loadtxt(f'{prefix}_b1.csv', delimiter=',')
-        W2 = np.loadtxt(f'{prefix}_W2.csv', delimiter=',')
-        b2 = np.loadtxt(f'{prefix}_b2.csv', delimiter=',')
-        return W1, b1, W2, b2
 
 def load_data_from_directory(directory_path):
     """
@@ -355,6 +436,36 @@ def calculate_metrics(y_true, y_pred):
     }
 
 if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Stock Price Prediction Neural Network")
+    parser.add_argument("--hidden_size", type=int, default=16,
+                       help="Number of neurons in hidden layer")
+    parser.add_argument("--learning_rate", type=float, default=0.0001,
+                       help="Learning rate for training")
+    parser.add_argument("--batch_size", type=int, default=32,
+                       help="Batch size for training")
+    parser.add_argument("--x_features", type=str, default="open,high,low,close,vol",
+                       help="Comma-separated list of input features")
+    parser.add_argument("--y_feature", type=str, default="close",
+                       help="Target feature to predict")
+    parser.add_argument("--data_file", type=str, required=True,
+                       help="Path to the input CSV file")
+    
+    args = parser.parse_args()
+    
+    # Validate and normalize data file path
+    if not args.data_file:
+        raise ValueError("Data file path is required")
+    
+    # Convert to absolute path if not already
+    if not os.path.isabs(args.data_file):
+        args.data_file = os.path.abspath(args.data_file)
+    
+    # Validate data file exists
+    if not os.path.exists(args.data_file):
+        raise ValueError(f"Data file not found: {args.data_file}")
+    
     # Create timestamp for this training run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     model_dir = f"model_{timestamp}"
@@ -371,21 +482,23 @@ if __name__ == "__main__":
         print(f"Created plots directory: {plots_dir}")
     
     # Load and prepare data
-    directory_path = "/Users/porupine/redline/data/gamestop_us.csv"
     print("Loading data...")
-    df = pd.read_csv(directory_path)
+    df = pd.read_csv(args.data_file)
     
-    # Validate required columns
-    required_columns = ['open', 'high', 'low', 'close', 'vol']
-    if not all(col in df.columns for col in required_columns):
-        raise ValueError(f"CSV file must contain columns: {required_columns}")
+    # Validate features
+    x_features = args.x_features.split(',')
+    y_feature = args.y_feature
+    
+    required_features = x_features + [y_feature]
+    if not all(col in df.columns for col in required_features):
+        raise ValueError(f"CSV file must contain columns: {required_features}")
     
     # Prepare features and target
     print("Preparing features and target...")
-    X = df[['open', 'high', 'low', 'close', 'vol']].values
-    Y = df['close'].values.reshape(-1, 1)
+    X = df[x_features].values
+    Y = df[y_feature].values.reshape(-1, 1)
     dates = pd.to_datetime(df.index) if 'timestamp' in df.columns else pd.date_range(start='2020-01-01', periods=len(df))
-
+    
     # Normalize data
     print("Normalizing data...")
     X_min = np.min(X, axis=0)
@@ -395,128 +508,137 @@ if __name__ == "__main__":
     Y_min = np.min(Y)
     Y_max = np.max(Y)
     Y = (Y - Y_min) / (Y_max - Y_min + 1e-8)
-
+    
     # Save normalization parameters for inference
     print("Saving normalization parameters...")
     np.savetxt(os.path.join(model_dir, 'scaler_mean.csv'), X_min, delimiter=',')
     np.savetxt(os.path.join(model_dir, 'scaler_std.csv'), X_max - X_min, delimiter=',')
     np.savetxt(os.path.join(model_dir, 'target_min.csv'), np.array([Y_min]).reshape(1, -1), delimiter=',')
     np.savetxt(os.path.join(model_dir, 'target_max.csv'), np.array([Y_max]).reshape(1, -1), delimiter=',')
-
+    
+    # Save feature selection information
+    feature_info = {
+        'x_features': x_features,
+        'y_feature': y_feature,
+        'input_size': len(x_features)
+    }
+    with open(os.path.join(model_dir, 'feature_info.json'), 'w') as f:
+        json.dump(feature_info, f)
+    
     # Split data into training and test sets
     print("Splitting data into training and test sets...")
     X_train, X_test, Y_train, Y_test = train_test_split_manual(X, Y, test_size=0.2, random_state=42)
     dates_train = dates[:len(X_train)]
     dates_test = dates[len(X_train):]
-
+    
     # Initialize and train model
     print("\nInitializing and training model...")
-    model = StockNet(input_size=5, hidden_size=16)
+    model = StockNet(input_size=len(x_features), hidden_size=args.hidden_size)
+    
+    # Save training data for visualization
+    training_data = pd.DataFrame({
+        **{feat: X_train[:, i] for i, feat in enumerate(x_features)},
+        y_feature: Y_train.flatten()
+    })
+    training_data.to_csv(os.path.join(model_dir, 'training_data.csv'), index=False)
     
     # Track training metrics
     train_losses = []
     val_losses = []
     
-    def train_with_validation(model, X_train, Y_train, X_val, Y_val, epochs=1000, learning_rate=0.0001, batch_size=32):
-        n_samples = X_train.shape[0]
-        best_val_mse = float('inf')
-        patience = 20
-        patience_counter = 0
-        
-        # Create directory for saving weights history
-        weights_dir = os.path.join(model_dir, 'weights_history')
-        if not os.path.exists(weights_dir):
-            os.makedirs(weights_dir)
-        
-        # Save initial weights
-        weights_history = []
-        weights_history.append(np.concatenate([model.W1.flatten(), model.W2.flatten()]))
-        np.savetxt(os.path.join(weights_dir, f'weights_history_0000.csv'), 
-                   weights_history[-1], delimiter=',')
-        
-        for epoch in range(epochs):
-            # Training
-            indices = np.random.permutation(n_samples)
-            total_mse = 0
-            n_batches = 0
-            
-            for start_idx in range(0, n_samples, batch_size):
-                end_idx = min(start_idx + batch_size, n_samples)
-                batch_indices = indices[start_idx:end_idx]
-                
-                X_batch = X_train[batch_indices]
-                y_batch = Y_train[batch_indices]
-                
-                output = model.forward(X_batch)
-                model.backward(X_batch, y_batch, output, learning_rate)
-                
-                batch_mse = np.mean((output - y_batch) ** 2)
-                total_mse += batch_mse
-                n_batches += 1
-            
-            avg_train_mse = total_mse / n_batches
-            train_losses.append(avg_train_mse)
-            
-            # Save weights every 10 epochs
-            if epoch % 10 == 0:
-                weights_history.append(np.concatenate([model.W1.flatten(), model.W2.flatten()]))
-                np.savetxt(os.path.join(weights_dir, f'weights_history_{epoch:04d}.csv'), 
-                          weights_history[-1], delimiter=',')
-            
-            # Validation
-            val_output = model.forward(X_val)
-            val_mse = np.mean((val_output - Y_val) ** 2)
-            val_losses.append(val_mse)
-            
-            if val_mse < best_val_mse:
-                best_val_mse = val_mse
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-                
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}, Train MSE: {avg_train_mse:.6f}, Val MSE: {val_mse:.6f}")
-        
-        # Save final weights
-        weights_history.append(np.concatenate([model.W1.flatten(), model.W2.flatten()]))
-        np.savetxt(os.path.join(weights_dir, f'weights_history_{epoch:04d}.csv'), 
-                  weights_history[-1], delimiter=',')
-        
-        # Save training losses
-        np.savetxt(os.path.join(model_dir, 'training_losses.csv'), 
-                  np.array(train_losses), delimiter=',')
+    # Create directory for saving weights history
+    weights_dir = os.path.join(model_dir, 'weights_history')
+    if not os.path.exists(weights_dir):
+        os.makedirs(weights_dir)
     
-    # Train with validation
-    train_with_validation(model, X_train, Y_train, X_test, Y_test)
-
-    # Save trained weights with timestamp
-    print("\nSaving model weights...")
-    model_prefix = os.path.join(model_dir, f'stock_model_{timestamp}')
-    model.save_weights(prefix=model_prefix)
-
-    # Save model metadata
-    metadata = {
-        'timestamp': timestamp,
-        'input_size': 5,
-        'hidden_size': 4,
-        'output_size': 1,
-        'learning_rate': 0.001,
-        'batch_size': 32,
-        'epochs': 10000,
-        'training_samples': len(X_train),
-        'test_samples': len(X_test)
-    }
+    # Save initial weights
+    weights_history = []
+    weights_history.append({
+        'W1': model.W1,
+        'W2': model.W2
+    })
+    np.savez(os.path.join(weights_dir, 'weights_history_0000.npz'), 
+             W1=model.W1, W2=model.W2)
     
-    # Save metadata to a text file
-    with open(os.path.join(model_dir, 'model_metadata.txt'), 'w') as f:
-        f.write("Model Training Metadata\n")
-        f.write("=====================\n\n")
-        for key, value in metadata.items():
-            f.write(f"{key}: {value}\n")
+    # Training parameters
+    epochs = 1000
+    learning_rate = args.learning_rate
+    batch_size = args.batch_size
+    n_samples = X_train.shape[0]
+    best_val_mse = float('inf')
+    patience = 20
+    patience_counter = 0
+    
+    print("\nTraining model...")
+    for epoch in range(epochs):
+        # Training
+        indices = np.random.permutation(n_samples)
+        total_mse = 0
+        n_batches = 0
+        
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+            batch_indices = indices[start_idx:end_idx]
+            
+            X_batch = X_train[batch_indices]
+            y_batch = Y_train[batch_indices]
+            
+            output = model.forward(X_batch)
+            model.backward(X_batch, y_batch, output, learning_rate)
+            
+            batch_mse = np.mean((output - y_batch) ** 2)
+            total_mse += batch_mse
+            n_batches += 1
+        
+        avg_train_mse = total_mse / n_batches
+        train_losses.append(avg_train_mse)
+        
+        # Save weights every 10 epochs
+        if epoch % 10 == 0:
+            weights_history.append({
+                'W1': model.W1,
+                'W2': model.W2
+            })
+            np.savez(os.path.join(weights_dir, f'weights_history_{epoch:04d}.npz'), 
+                     W1=model.W1, W2=model.W2)
+        
+        # Validation
+        val_output = model.forward(X_test)
+        val_mse = np.mean((val_output - Y_test) ** 2)
+        val_losses.append(val_mse)
+        
+        if val_mse < best_val_mse:
+            best_val_mse = val_mse
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+            
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}, Train MSE: {avg_train_mse:.6f}, Val MSE: {val_mse:.6f}")
+    
+    # Save final weights
+    weights_history.append({
+        'W1': model.W1,
+        'W2': model.W2
+    })
+    np.savez(os.path.join(weights_dir, f'weights_history_{epoch:04d}.npz'), 
+             W1=model.W1, W2=model.W2)
+    
+    # Save training losses
+    np.savetxt(os.path.join(model_dir, 'training_losses.csv'), train_losses, delimiter=',')
+    
+    # Save model weights
+    model.save_weights(model_dir, prefix="stock_model")
+    
+    print("\nTraining complete!")
+    print(f"Final validation MSE: {best_val_mse:.6f}")
+    print(f"Model directory: {model_dir}")
+    print("\nUse predict.py to make predictions on new data.")
+    print("Example: python predict.py /Users/porupine/redline/data/gamestop_us.csv --model_dir", model_dir)
 
     # Evaluate model on both training and test sets
     print("\nEvaluating model...")

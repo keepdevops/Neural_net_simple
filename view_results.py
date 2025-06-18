@@ -21,21 +21,64 @@ import glob
 import sys
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+import json
+import numpy as np
+import pandas as pd
+
+# Add project directory to Python path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 def find_latest_model_dir():
     """Find the most recent model directory."""
     model_dirs = glob.glob("model_*")
     if not model_dirs:
-        raise FileNotFoundError("No model directories found. Please train a model first.")
+        models_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        if os.path.exists(models_dir):
+            model_dirs = glob.glob(os.path.join(models_dir, "model_*"))
+        if not model_dirs:
+            raise FileNotFoundError("No model directories found. Please train a model first.")
     return max(model_dirs, key=os.path.getctime)
 
-def load_plot_data(model_dir):
-    """Load all plot data from the model directory."""
-    plots_dir = os.path.join(model_dir, 'plots')
-    if not os.path.exists(plots_dir):
-        raise FileNotFoundError(f"Plots directory not found in {model_dir}")
-    
-    # Load metadata if available
+def load_model_info(model_dir):
+    """Load normalization, feature info, and training loss from the model directory."""
+    info = {}
+    # Feature info
+    feature_info_file = os.path.join(model_dir, 'feature_info.json')
+    if os.path.exists(feature_info_file):
+        with open(feature_info_file, 'r') as f:
+            feature_info = json.load(f)
+        info['x_features'] = feature_info.get('x_features', [])
+        info['y_feature'] = feature_info.get('y_feature', '')
+    else:
+        info['x_features'] = []
+        info['y_feature'] = ''
+    # Normalization
+    scaler_mean_file = os.path.join(model_dir, 'scaler_mean.csv')
+    scaler_std_file = os.path.join(model_dir, 'scaler_std.csv')
+    if os.path.exists(scaler_mean_file) and os.path.exists(scaler_std_file):
+        info['X_mean'] = np.loadtxt(scaler_mean_file, delimiter=',')
+        info['X_std'] = np.loadtxt(scaler_std_file, delimiter=',')
+    else:
+        info['X_mean'] = None
+        info['X_std'] = None
+    # Target normalization
+    target_min_file = os.path.join(model_dir, 'target_min.csv')
+    target_max_file = os.path.join(model_dir, 'target_max.csv')
+    if os.path.exists(target_min_file) and os.path.exists(target_max_file):
+        info['Y_min'] = float(np.loadtxt(target_min_file, delimiter=','))
+        info['Y_max'] = float(np.loadtxt(target_max_file, delimiter=','))
+    else:
+        info['Y_min'] = None
+        info['Y_max'] = None
+    # Training loss
+    training_loss_file = os.path.join(model_dir, 'training_losses.csv')
+    if os.path.exists(training_loss_file):
+        info['losses'] = np.loadtxt(training_loss_file, delimiter=',')
+        info['epochs'] = np.arange(1, len(info['losses']) + 1)
+    else:
+        info['losses'] = None
+        info['epochs'] = None
+    # Model metadata (optional)
     metadata = {}
     metadata_file = os.path.join(model_dir, 'model_metadata.txt')
     if os.path.exists(metadata_file):
@@ -44,78 +87,82 @@ def load_plot_data(model_dir):
                 if ':' in line:
                     key, value = line.split(':', 1)
                     metadata[key.strip()] = value.strip()
-    
-    return plots_dir, metadata
+    info['metadata'] = metadata
+    return info
 
-def display_plots(plots_dir, metadata):
-    """Display all plots in a grid layout."""
-    # Create a figure with a grid layout
+def display_plots(model_dir, info):
+    print(f"\nDisplaying results for model: {model_dir}")
+    print(f"Features: {info['x_features']}")
+    print(f"Target: {info['y_feature']}")
+
+    # Create figure with multiple subplots
     fig = plt.figure(figsize=(15, 10))
     gs = GridSpec(2, 2, figure=fig)
-    
-    # Display metadata if available
-    if metadata:
-        metadata_text = "Model Information:\n"
-        for key, value in metadata.items():
-            metadata_text += f"{key}: {value}\n"
-        fig.text(0.02, 0.98, metadata_text, fontsize=8, va='top')
-    
-    # Load and display each plot
-    plot_files = {
-        'loss_curves.png': (0, 0, 'Training and Validation Loss'),
-        'training_predictions.png': (0, 1, 'Training Set Predictions'),
-        'test_predictions.png': (1, 0, 'Test Set Predictions'),
-        'error_distribution.png': (1, 1, 'Error Distribution')
-    }
-    
-    for filename, (row, col, title) in plot_files.items():
-        filepath = os.path.join(plots_dir, filename)
-        if os.path.exists(filepath):
-            ax = fig.add_subplot(gs[row, col])
-            img = plt.imread(filepath)
-            ax.imshow(img)
-            ax.set_title(title)
-            ax.axis('off')
-    
-    # Add actual vs predicted scatter plot
-    scatter_file = os.path.join(plots_dir, 'actual_vs_predicted.png')
-    if os.path.exists(scatter_file):
-        fig2 = plt.figure(figsize=(8, 8))
-        img = plt.imread(scatter_file)
-        plt.imshow(img)
-        plt.title('Actual vs Predicted Prices')
-        plt.axis('off')
-    
+
+    # Plot 1: Training Loss
+    ax1 = fig.add_subplot(gs[0, 0])
+    if info['epochs'] is not None and info['losses'] is not None:
+        ax1.plot(info['epochs'], info['losses'])
+        ax1.set_title('Training Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+    else:
+        ax1.set_title('Training Loss (not available)')
+
+    # Plot 2: Feature Distribution
+    ax2 = fig.add_subplot(gs[0, 1])
+    if info['x_features']:
+        ax2.bar(range(len(info['x_features'])), [1]*len(info['x_features']), tick_label=info['x_features'])
+        ax2.set_title('Input Features')
+    else:
+        ax2.set_title('Input Features (not available)')
+
+    # Plot 3: Normalization Parameters
+    ax3 = fig.add_subplot(gs[1, 0])
+    if info['X_mean'] is not None and info['X_std'] is not None and info['x_features']:
+        means = np.array(info['X_mean'])
+        stds = np.array(info['X_std'])
+        ax3.bar(range(len(means)), means, yerr=stds, capsize=5)
+        ax3.set_title('Feature Normalization')
+        ax3.set_xticks(range(len(means)))
+        ax3.set_xticklabels(info['x_features'], rotation=45)
+    else:
+        ax3.set_title('Feature Normalization (not available)')
+
+    # Plot 4: Model Metadata
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.axis('off')
+    metadata_text = "\n".join([f"{k}: {v}" for k, v in info['metadata'].items()])
+    ax4.text(0.5, 0.5, metadata_text or 'No metadata', ha='center', va='center', fontsize=10)
+
     plt.tight_layout()
     plt.show()
 
+    # Show all PNG plots in the plots/ directory
+    plots_dir = os.path.join(model_dir, 'plots')
+    if os.path.exists(plots_dir):
+        plot_files = sorted(glob.glob(os.path.join(plots_dir, '*.png')))
+        for plot_file in plot_files:
+            img = plt.imread(plot_file)
+            plt.figure(figsize=(10, 6))
+            plt.imshow(img)
+            plt.axis('off')
+            plt.title(os.path.basename(plot_file))
+            plt.show()
+    else:
+        print('No plots directory found.')
+
 def main():
-    """Main function to display model results."""
-    # Get model directory from command line or use most recent
     if len(sys.argv) > 1:
         model_dir = sys.argv[1]
-        if not os.path.exists(model_dir):
-            print(f"Error: Model directory '{model_dir}' not found.")
-            sys.exit(1)
     else:
-        try:
-            model_dir = find_latest_model_dir()
-            print(f"Using most recent model directory: {model_dir}")
-        except FileNotFoundError as e:
-            print(f"Error: {str(e)}")
-            sys.exit(1)
-    
+        model_dir = find_latest_model_dir()
     try:
-        # Load plot data
-        plots_dir, metadata = load_plot_data(model_dir)
-        
-        # Display plots
-        print(f"\nDisplaying plots from {model_dir}...")
-        display_plots(plots_dir, metadata)
-        
+        info = load_model_info(model_dir)
+        display_plots(model_dir, info)
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Error displaying results: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()
