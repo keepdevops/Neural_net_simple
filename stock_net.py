@@ -90,7 +90,7 @@ class StockNet:
     - Weight saving/loading
     """
     
-    def __init__(self, input_size, hidden_size=16, output_size=1):
+    def __init__(self, input_size, hidden_size=4, output_size=1):
         """
         Initialize the neural network with specified architecture.
         
@@ -439,7 +439,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Stock Price Prediction Neural Network")
-    parser.add_argument("--hidden_size", type=int, default=16,
+    parser.add_argument("--hidden_size", type=int, default=4,
                        help="Number of neurons in hidden layer")
     parser.add_argument("--learning_rate", type=float, default=0.0001,
                        help="Learning rate for training")

@@ -26,8 +26,12 @@ import json
 import numpy as np
 import tempfile
 import threading
+import concurrent.futures
 import importlib.util
 import time
+from PIL import Image, ImageTk
+import path_utils
+import script_launcher
 
 # Import stock_net module
 try:
@@ -55,7 +59,7 @@ def sigmoid_derivative(x):
 class StockNet:
     """Neural network for stock price prediction."""
     
-    def __init__(self, input_size, hidden_size=16, output_size=1):
+    def __init__(self, input_size, hidden_size=4, output_size=1):
         """Initialize the neural network with specified architecture."""
         # Initialize weights using Xavier/Glorot initialization
         self.W1 = np.random.randn(input_size, hidden_size) * np.sqrt(2.0 / input_size)
@@ -155,6 +159,14 @@ class StockPredictionGUI:
         self.style.configure("TFrame",
                            background=FRAME_COLOR)
         
+        # Initialize image cache for plots (optimization)
+        self.plot_image_cache = {}  # Cache for resized plot images
+        self.max_cache_size = 50  # Maximum number of cached images
+        
+        # Initialize thread pool for plot loading operations
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self.plot_futures = {}  # Track ongoing plot loading operations
+        
         # Initialize variables
         self.data_file = None
         self.data_file_var = tk.StringVar()  # Variable for data file entry
@@ -192,6 +204,9 @@ class StockPredictionGUI:
         # Selected prediction file
         self.selected_prediction_file = None
         
+        # Test script availability on startup
+        self.test_script_availability()
+        
         # Create main layout
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=7)  # Controls panel (70%)
@@ -205,6 +220,31 @@ class StockPredictionGUI:
         
         # Initialize model list
         self.refresh_models()
+
+    def test_script_availability(self):
+        """Test if all required scripts are available and log the results."""
+        try:
+            availability = script_launcher.launcher.test_script_availability()
+            
+            # Log results
+            print("Script availability check:")
+            for script, available in availability.items():
+                status = "✅ Available" if available else "❌ Not found"
+                print(f"  {script}: {status}")
+            
+            # Check if all scripts are available
+            all_available = all(availability.values())
+            if all_available:
+                print("✅ All required scripts are available")
+                self.status_var.set("Ready - All scripts available")
+            else:
+                missing_scripts = [script for script, available in availability.items() if not available]
+                print(f"⚠️  Missing scripts: {missing_scripts}")
+                self.status_var.set(f"Warning - Missing scripts: {', '.join(missing_scripts)}")
+                
+        except Exception as e:
+            print(f"Error testing script availability: {e}")
+            self.status_var.set("Error testing script availability")
 
     def create_display_panel(self):
         """Create the right display panel for plots and results (now using grid)"""
@@ -337,7 +377,63 @@ class StockPredictionGUI:
         
         print("3D Gradient Descent tab created successfully")
         
+        # Saved Plots Tab (New)
+        saved_plots_frame = ttk.Frame(self.display_notebook)
+        self.display_notebook.add(saved_plots_frame, text="Saved Plots")
+        saved_plots_frame.grid_columnconfigure(0, weight=1)
+        saved_plots_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create scrollable canvas for images
+        self.saved_plots_canvas = tk.Canvas(saved_plots_frame, bg=FRAME_COLOR)
+        self.saved_plots_canvas.grid(row=0, column=0, sticky="nsew")
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(saved_plots_frame, orient="vertical", command=self.saved_plots_canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.saved_plots_canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Create frame inside canvas to hold images
+        self.saved_plots_inner_frame = ttk.Frame(self.saved_plots_canvas)
+        self.saved_plots_canvas.create_window((0, 0), window=self.saved_plots_inner_frame, anchor="nw")
+        
+        # Placeholder label
+        self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                text="Select a model to view saved plots", 
+                                                foreground=TEXT_COLOR, background=FRAME_COLOR)
+        self.saved_plots_placeholder.pack(pady=20)
+        
+        # Bind canvas resizing
+        self.saved_plots_inner_frame.bind("<Configure>", lambda e: self.saved_plots_canvas.configure(
+            scrollregion=self.saved_plots_canvas.bbox("all")))
+        
+        print("Saved Plots tab created successfully")
+        
+        # Bind tab selection events
+        self.display_notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
+        
         print(f"Display panel created with {self.display_notebook.index('end')} tabs")
+
+    def on_tab_changed(self, event):
+        """Handle tab selection changes"""
+        try:
+            current_tab = self.display_notebook.select()
+            tab_index = self.display_notebook.index(current_tab)
+            tab_text = self.display_notebook.tab(tab_index, "text")
+            
+            # Auto-refresh 3D Gradient Descent tab when selected
+            if tab_text == "3D Gradient Descent":
+                self.update_3d_gradient_descent_tab()
+                if self.has_3d_visualization():
+                    self.status_var.set("3D Gradient Descent visualization loaded")
+                else:
+                    self.status_var.set("No 3D visualization found - Use 'Generate 3D Gradient Descent' button")
+            
+            # Auto-refresh Saved Plots tab when selected
+            elif tab_text == "Saved Plots":
+                self.load_saved_plots()
+                
+        except Exception as e:
+            print(f"Error in tab change handler: {e}")
 
     def browse_data_file(self):
         """Open file dialog to select data file"""
@@ -589,13 +685,22 @@ class StockPredictionGUI:
         ttk.Label(train_frame, text="Patience Epoch:").grid(row=6, column=0, sticky="ew", pady=2)
         ttk.Entry(train_frame, textvariable=self.patience_var).grid(row=7, column=0, sticky="ew", pady=2)
         ttk.Label(train_frame, text="Training Progress:").grid(row=8, column=0, sticky="ew", pady=2)
+        
+        # Add progress bar
         progress_frame = ttk.Frame(train_frame)
-        progress_frame.grid(row=9, column=0, sticky="nsew", pady=2)
+        progress_frame.grid(row=9, column=0, sticky="ew", pady=2)
         progress_frame.grid_columnconfigure(0, weight=1)
-        progress_frame.grid_rowconfigure(0, weight=1)
-        self.progress_text = tk.Text(progress_frame, height=10, wrap=tk.WORD)
+        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate')
+        self.progress_bar.grid(row=0, column=0, sticky="ew", pady=2)
+        
+        # Progress text area
+        text_frame = ttk.Frame(train_frame)
+        text_frame.grid(row=10, column=0, sticky="nsew", pady=2)
+        text_frame.grid_columnconfigure(0, weight=1)
+        text_frame.grid_rowconfigure(0, weight=1)
+        self.progress_text = tk.Text(text_frame, height=10, wrap=tk.WORD)
         self.progress_text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(progress_frame, orient="vertical", command=self.progress_text.yview)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.progress_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.progress_text.configure(yscrollcommand=scrollbar.set)
         self.progress_text.configure(state="disabled")
@@ -605,7 +710,19 @@ class StockPredictionGUI:
         self.train_button.grid(row=0, column=0, sticky="ew", pady=2)
         ttk.Button(action_frame, text="Make Prediction", command=self.make_prediction).grid(row=1, column=0, sticky="ew", pady=2)
         ttk.Button(action_frame, text="View Results", command=self._view_training_results).grid(row=2, column=0, sticky="ew", pady=2)
-        ttk.Button(action_frame, text="Show Visualization", command=self._show_gradient_descent).grid(row=3, column=0, sticky="ew", pady=2)
+        ttk.Button(action_frame, text="Generate 3D Gradient Descent", command=self.trigger_gradient_descent_visualization).grid(row=3, column=0, sticky="ew", pady=2)
+        self.stop_button = ttk.Button(action_frame, text="Stop Training", command=self.stop_training, state=tk.DISABLED)
+        self.stop_button.grid(row=4, column=0, sticky="ew", pady=2)
+        
+        # Cache management button
+        cache_frame = ttk.Frame(action_frame)
+        cache_frame.grid(row=5, column=0, sticky="ew", pady=2)
+        cache_frame.grid_columnconfigure(0, weight=1)
+        cache_frame.grid_columnconfigure(1, weight=0)
+        ttk.Button(cache_frame, text="Clear Plot Cache", command=self.clear_plot_cache).grid(row=0, column=0, sticky="ew", pady=2)
+        self.cache_info_label = ttk.Label(cache_frame, text="Cache: 0 images", foreground="blue")
+        self.cache_info_label.grid(row=0, column=1, sticky="e", padx=5)
+        
         status_frame = ttk.Frame(control_frame)
         status_frame.grid(row=2, column=0, sticky="ew", pady=5)
         ttk.Label(status_frame, textvariable=self.status_var).grid(row=0, column=0, sticky="ew")
@@ -640,50 +757,67 @@ class StockPredictionGUI:
         self.validate_features()
 
     def make_prediction(self):
-        """Make predictions using the selected model"""
+        """Make predictions using the selected model and save plots"""
         if not self.selected_model_path:
             messagebox.showerror("Error", "Please select a model first")
             return
-            
+        
         if not self.data_file:
             messagebox.showerror("Error", "Please select a data file first")
             return
-            
-        if not self.validate_features():
-            return
-            
+        
         try:
+            # Get selected features
+            if self.features_locked and hasattr(self, 'locked_features') and self.locked_features:
+                x_indices = self.locked_features
+                x_features = [self.x_features_listbox.get(i) for i in x_indices]
+            else:
+                x_indices = self.x_features_listbox.curselection()
+                if not x_indices:
+                    messagebox.showerror("Error", "Please select input features")
+                    return
+                x_features = [self.x_features_listbox.get(i) for i in x_indices]
+            
+            y_feature = self.y_features_combo.get()
+            if not y_feature:
+                messagebox.showerror("Error", "Please select a target feature")
+                return
+            
             self.status_var.set("Making predictions...")
             self.root.update()
             
-            cmd = [
-                sys.executable, "predict.py",
-                self.data_file,
-                "--model_dir", self.selected_model_path,
-                "--x_features", ",".join(self.x_features),
-                "--y_feature", self.y_feature
-            ]
+            # Use script launcher to run prediction
+            success, stdout, stderr = script_launcher.launch_prediction(
+                data_file=self.data_file,
+                model_dir=self.selected_model_path,
+                x_features=x_features,
+                y_feature=y_feature
+            )
             
-            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
-            
-            if process.returncode == 0:
-                # Find the predictions file
-                pred_files = glob.glob("predictions_*.csv")
-                if pred_files:
-                    latest_pred = max(pred_files, key=os.path.getctime)
-                    self.display_predictions(latest_pred)
-                    messagebox.showinfo("Success", "Predictions completed successfully!")
-                else:
-                    messagebox.showerror("Error", "Predictions file not found")
+            if success:
+                # Refresh the saved plots and predictions
+                self.load_saved_plots()
+                self.refresh_predictions()
+                
+                # Switch to Saved Plots tab to show the new prediction plot
+                self.switch_to_tab(1)
+                
+                self.status_var.set("Prediction completed successfully")
+                messagebox.showinfo("Success", 
+                                  "Prediction completed successfully!\n"
+                                  "Check the 'Saved Plots' tab to view the results.")
             else:
-                messagebox.showerror("Error", f"Prediction failed:\n{stderr.decode()}")
+                error_msg = stderr if stderr else stdout
+                messagebox.showerror("Error", f"Prediction failed:\n{error_msg}")
+                self.status_var.set("Prediction failed")
                 
         except Exception as e:
-            messagebox.showerror("Error", f"An error occurred: {str(e)}")
-        finally:
-            self.status_var.set("Ready")
-            
+            messagebox.showerror("Error", f"Error making prediction: {str(e)}")
+            self.status_var.set("Error in prediction")
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _view_training_results(self):
         """View training results and plots"""
         if not self.selected_model_path:
@@ -716,33 +850,6 @@ class StockPredictionGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to view results: {str(e)}")
 
-    def _show_gradient_descent(self):
-        """Show the 3D gradient descent visualization"""
-        if not self.selected_model_path:
-            messagebox.showerror("Error", "Please select a model first")
-            return
-            
-        # Get visualization settings
-        color = self.color_var.get()
-        point_size = self.point_size_var.get()
-        line_width = self.line_width_var.get()
-        surface_alpha = self.surface_alpha_var.get()
-        
-        # Construct the command
-        cmd = [
-            "python3", "gradient_descent_3d.py",
-            "--model_dir", self.selected_model_path,
-            "--color", color,
-            "--point_size", str(point_size),
-            "--line_width", str(line_width),
-            "--surface_alpha", str(surface_alpha)
-        ]
-        
-        try:
-            subprocess.Popen(cmd)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to start visualization: {str(e)}")
-            
     def _load_model_info(self):
         """Load and display information about the selected model"""
         if not self.selected_model_path:
@@ -769,8 +876,14 @@ class StockPredictionGUI:
         selection = self.model_listbox.curselection()
         if selection:
             model_name = self.model_listbox.get(selection[0])
-            # Create the full path to the selected model without modifying current_model_dir
-            self.selected_model_path = os.path.join(self.current_model_dir, model_name)
+            
+            # Find the actual model directory using path utilities
+            model_dir = path_utils.find_model_directory(model_name)
+            if model_dir:
+                self.selected_model_path = model_dir
+            else:
+                # Fallback to current directory
+                self.selected_model_path = os.path.join(self.current_model_dir, model_name)
             
             # Load feature info from selected model
             feature_info_path = os.path.join(self.selected_model_path, 'feature_info.json')
@@ -789,6 +902,46 @@ class StockPredictionGUI:
                     self.status_var.set(f"Loaded features: X={self.x_features}, Y={self.y_feature}")
             else:
                 self.status_var.set("No feature info found for selected model")
+            
+            # Load saved plots
+            self.load_saved_plots()
+            
+            # Update 3D Gradient Descent tab with visualization if available
+            self.update_3d_gradient_descent_tab()
+            
+            # Check if 3D visualization exists and show notification
+            if self.has_3d_visualization():
+                self.status_var.set(f"Model loaded with 3D visualization available - Check 3D Gradient Descent tab")
+            else:
+                self.status_var.set(f"Model loaded - Use 'Create 3D Visualization' button to generate 3D plots")
+        else:
+            self.selected_model_path = None
+            self.load_saved_plots()  # Clear plots
+            # Clear 3D tab
+            self.gd3d_ax.clear()
+            self.gd3d_ax.text(0.5, 0.5, 0.5, 'Select a model to view 3D gradient descent visualization', 
+                             ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                             fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+            self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+            self.gd3d_canvas.draw()
+
+    def has_3d_visualization(self):
+        """Check if the selected model has 3D gradient descent visualization files."""
+        if not self.selected_model_path:
+            return False
+        
+        plots_dir = os.path.join(self.selected_model_path, 'plots')
+        if not os.path.exists(plots_dir):
+            return False
+        
+        # Check for gradient descent 3D visualization files
+        gd3d_files = glob.glob(os.path.join(plots_dir, 'gradient_descent_3d_frame_*.png'))
+        if gd3d_files:
+            return True
+        
+        # Fallback check for any gradient descent related image
+        gd3d_files = glob.glob(os.path.join(plots_dir, '*gradient_descent*3d*.png'))
+        return len(gd3d_files) > 0
 
     def refresh_models(self):
         """Refresh the list of available models"""
@@ -799,27 +952,35 @@ class StockPredictionGUI:
             # Clear selected model path when refreshing
             self.selected_model_path = None
             
-            # Check if model directory exists
-            if not os.path.exists(self.current_model_dir):
-                os.makedirs(self.current_model_dir, exist_ok=True)
-                self.status_var.set(f"Created models directory: {self.current_model_dir}")
-                return
-                
-            # Get list of model directories
-            model_dirs = sorted([
-                d for d in os.listdir(self.current_model_dir)
-                if os.path.isdir(os.path.join(self.current_model_dir, d))
-            ], reverse=True)  # Sort by name (most recent first)
+            # Use path utilities to find model directories
+            model_dirs = []
+            
+            # Search in multiple locations
+            search_paths = ['.', 'simple', 'models', 'production_models']
+            for base_path in search_paths:
+                if os.path.exists(base_path):
+                    pattern = os.path.join(base_path, 'model_*')
+                    found_models = glob.glob(pattern)
+                    model_dirs.extend(found_models)
+            
+            # Remove duplicates and sort by creation time (newest first)
+            model_dirs = list(set(model_dirs))
+            model_dirs.sort(key=os.path.getctime, reverse=True)
             
             # Add models to listbox
             for model_dir in model_dirs:
-                self.model_listbox.insert(tk.END, model_dir)
+                model_name = os.path.basename(model_dir)
+                self.model_listbox.insert(tk.END, model_name)
                 
             # If there are any models, select the first one
             if model_dirs:
                 self.model_listbox.selection_set(0)
+                self.on_model_select(None)  # Trigger plot loading
+                self.status_var.set(f"Loaded {len(model_dirs)} model(s)")
+                print(f"Found {len(model_dirs)} models: {[os.path.basename(d) for d in model_dirs]}")
             else:
                 self.status_var.set("No models available")
+                self.load_saved_plots()
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh model list: {str(e)}")
@@ -842,8 +1003,20 @@ class StockPredictionGUI:
         try:
             import shutil
             for model_name in model_names:
-                model_path = os.path.join(self.current_model_dir, model_name)
-                shutil.rmtree(model_path)
+                # Find the actual model directory using path utilities
+                model_dir = path_utils.find_model_directory(model_name)
+                if model_dir:
+                    model_path = model_dir
+                else:
+                    # Fallback to current directory
+                    model_path = os.path.join(self.current_model_dir, model_name)
+                
+                if os.path.exists(model_path):
+                    shutil.rmtree(model_path)
+                    print(f"Deleted model: {model_path}")
+                else:
+                    print(f"Model not found: {model_path}")
+            
             # Refresh model list
             self.refresh_models()
             # Update status
@@ -945,13 +1118,30 @@ class StockPredictionGUI:
             self.pred_ax.clear()
             
             if 'actual' in df.columns and 'predicted' in df.columns:
-                # Plot actual vs predicted
-                self.pred_ax.plot(df['actual'], label='Actual', alpha=0.7, linewidth=2)
-                self.pred_ax.plot(df['predicted'], label='Predicted', alpha=0.7, linewidth=2)
-                self.pred_ax.set_title(f"Actual vs Predicted Values ({ticker})\nModel: {current_model}")
-                self.pred_ax.set_xlabel("Data Point")
-                self.pred_ax.set_ylabel("Price")
-                self.pred_ax.legend()
+                # Check if we have date/time columns for x-axis
+                if 'date' in df.columns or 'timestamp' in df.columns:
+                    date_col = 'date' if 'date' in df.columns else 'timestamp'
+                    # Convert to datetime if not already
+                    df[date_col] = pd.to_datetime(df[date_col])
+                    
+                    self.pred_ax.plot(df[date_col], df['actual'], label='Actual', alpha=0.7, linewidth=2)
+                    self.pred_ax.plot(df[date_col], df['predicted'], label='Predicted', alpha=0.7, linewidth=2)
+                    self.pred_ax.set_title(f"Actual vs Predicted Values ({ticker})\nModel: {current_model}")
+                    self.pred_ax.set_xlabel("Date")
+                    self.pred_ax.set_ylabel("Price")
+                    self.pred_ax.legend()
+                    
+                    # Format x-axis dates
+                    self.pred_ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d'))
+                    plt.setp(self.pred_ax.get_xticklabels(), rotation=45)
+                else:
+                    # No date column, use index
+                    self.pred_ax.plot(df['actual'], label='Actual', alpha=0.7, linewidth=2)
+                    self.pred_ax.plot(df['predicted'], label='Predicted', alpha=0.7, linewidth=2)
+                    self.pred_ax.set_title(f"Actual vs Predicted Values ({ticker})\nModel: {current_model}")
+                    self.pred_ax.set_xlabel("Data Point")
+                    self.pred_ax.set_ylabel("Price")
+                    self.pred_ax.legend()
                 
                 # Add correlation info
                 correlation = np.corrcoef(df['actual'], df['predicted'])[0, 1]
@@ -961,11 +1151,25 @@ class StockPredictionGUI:
                                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
             else:
                 # Plot predictions only
-                self.pred_ax.plot(df.iloc[:, -1], label='Predictions', linewidth=2)
-                self.pred_ax.set_title(f"Predictions ({ticker})\nModel: {current_model}")
-                self.pred_ax.set_xlabel("Data Point")
-                self.pred_ax.set_ylabel("Price")
-                self.pred_ax.legend()
+                if 'date' in df.columns or 'timestamp' in df.columns:
+                    date_col = 'date' if 'date' in df.columns else 'timestamp'
+                    df[date_col] = pd.to_datetime(df[date_col])
+                    
+                    self.pred_ax.plot(df[date_col], df.iloc[:, -1], label='Predictions', linewidth=2)
+                    self.pred_ax.set_title(f"Predictions ({ticker})\nModel: {current_model}")
+                    self.pred_ax.set_xlabel("Date")
+                    self.pred_ax.set_ylabel("Price")
+                    self.pred_ax.legend()
+                    
+                    # Format x-axis dates
+                    self.pred_ax.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y-%m-%d'))
+                    plt.setp(self.pred_ax.get_xticklabels(), rotation=45)
+                else:
+                    self.pred_ax.plot(df.iloc[:, -1], label='Predictions', linewidth=2)
+                    self.pred_ax.set_title(f"Predictions ({ticker})\nModel: {current_model}")
+                    self.pred_ax.set_xlabel("Data Point")
+                    self.pred_ax.set_ylabel("Price")
+                    self.pred_ax.legend()
             
             self.pred_ax.grid(True, alpha=0.3)
             self.pred_canvas.draw()
@@ -1282,6 +1486,10 @@ class StockPredictionGUI:
             best_val_mse = float('inf')
             patience_counter = 0
             
+            # Configure progress bar
+            self.root.after(0, lambda: self.progress_bar.configure(maximum=epochs))
+            self.root.after(0, lambda: self.progress_bar.configure(value=0))
+            
             # Track training progress
             train_losses = []
             val_losses = []
@@ -1294,6 +1502,10 @@ class StockPredictionGUI:
             
             print(f"Training started in directory: {model_dir}")
             self.root.after(0, lambda: self.update_progress(f"Training started in directory: {model_dir}"))
+            
+            # Enable stop button and disable train button
+            self.root.after(0, lambda: self.stop_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.train_button.config(state=tk.DISABLED))
             
             # Training loop
             for epoch in range(epochs):
@@ -1362,12 +1574,32 @@ class StockPredictionGUI:
                 if patience_counter >= patience:
                     self.root.after(0, lambda: self.update_progress(f"Early stopping at epoch {epoch+1}"))
                     break
+                
+                # Update progress bar
+                self.root.after(0, lambda e=epoch: self.progress_bar.configure(value=e+1))
             
             # Save model and results
             model.save_weights(model_dir, prefix="stock_model")
             
+            # Also save as NPZ file for compatibility with predict.py
+            np.savez_compressed(
+                os.path.join(model_dir, 'stock_model.npz'),
+                W1=model.W1,
+                b1=model.b1,
+                W2=model.W2,
+                b2=model.b2,
+                X_min=X_min,
+                X_max=X_max,
+                Y_min=Y_min,
+                Y_max=Y_max,
+                has_target_norm=True,
+                input_size=input_size,
+                hidden_size=hidden_size
+            )
+            
             # Save training losses
-            np.savetxt(os.path.join(model_dir, 'training_losses.csv'), train_losses, delimiter=',')
+            np.savetxt(os.path.join(model_dir, 'training_losses.csv'), 
+                      np.column_stack((train_losses, val_losses)), delimiter=',')
             
             # Save feature info
             feature_info = {
@@ -1378,11 +1610,30 @@ class StockPredictionGUI:
             with open(os.path.join(model_dir, 'feature_info.json'), 'w') as f:
                 json.dump(feature_info, f)
             
+            # Save model metadata
+            metadata = {
+                'data_file': self.data_file,
+                'hidden_size': hidden_size,
+                'learning_rate': learning_rate,
+                'batch_size': batch_size,
+                'patience': patience,
+                'training_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'total_epochs': len(train_losses),
+                'final_train_loss': train_losses[-1] if train_losses else 0,
+                'final_val_loss': val_losses[-1] if val_losses else 0
+            }
+            with open(os.path.join(model_dir, 'model_metadata.txt'), 'w') as f:
+                for key, value in metadata.items():
+                    f.write(f"{key}: {value}\n")
+            
             # Save normalization parameters
             np.savetxt(os.path.join(model_dir, 'scaler_mean.csv'), X_min, delimiter=',')
             np.savetxt(os.path.join(model_dir, 'scaler_std.csv'), X_max - X_min, delimiter=',')
             np.savetxt(os.path.join(model_dir, 'target_min.csv'), np.array([Y_min]).reshape(1, -1), delimiter=',')
             np.savetxt(os.path.join(model_dir, 'target_max.csv'), np.array([Y_max]).reshape(1, -1), delimiter=',')
+            
+            # Disable stop button
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
             
             # Update GUI on completion
             self.root.after(0, lambda: self._training_completed(model_dir, train_losses, val_losses))
@@ -1392,16 +1643,83 @@ class StockPredictionGUI:
             print("Error occurred")
             print(f"Error: {e}")
             self.root.after(0, lambda: messagebox.showerror("Training Error", f"Training failed: {str(e)}"))
+            self.root.after(0, lambda: self.progress_bar.configure(value=0))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.DISABLED))
             self.root.after(0, self._enable_train_button)
 
     def _training_completed(self, model_dir, train_losses, val_losses):
-        """Handle training completion"""
+        """Handle training completion and save plots."""
         try:
-            # Update status
             self.status_var.set("Training completed successfully!")
-            
-            # Re-enable train button
+            self.progress_bar.configure(value=0)
+            self.stop_button.config(state=tk.DISABLED)
             self.train_button.config(state=tk.NORMAL)
+            
+            # Calculate training statistics
+            final_train_loss = train_losses[-1] if train_losses else 0.0
+            final_val_loss = val_losses[-1] if val_losses else 0.0
+            total_epochs = len(train_losses)
+            
+            # Save loss plot with enhanced styling
+            plots_dir = os.path.join(model_dir, 'plots')
+            os.makedirs(plots_dir, exist_ok=True)
+            
+            fig = plt.Figure(figsize=(10, 7))
+            ax = fig.add_subplot(111)
+            epochs = list(range(1, len(train_losses) + 1))
+            
+            # Plot training loss
+            ax.plot(epochs, train_losses, 'b-', linewidth=2, label='Training Loss', alpha=0.8)
+            
+            # Plot validation loss if available
+            if val_losses and len(val_losses) == len(train_losses):
+                ax.plot(epochs, val_losses, 'r-', linewidth=2, label='Validation Loss', alpha=0.8)
+            
+            # Enhanced styling
+            ax.set_title(f"Training Progress - {self.get_ticker_from_filename()}", fontsize=14, fontweight='bold')
+            ax.set_xlabel("Epoch", fontsize=12)
+            ax.set_ylabel("MSE Loss", fontsize=12)
+            ax.legend(fontsize=11)
+            ax.grid(True, alpha=0.3)
+            
+            # Add final loss annotations
+            ax.annotate(f'Final Train Loss: {final_train_loss:.6f}', 
+                       xy=(total_epochs, final_train_loss), 
+                       xytext=(total_epochs*0.7, final_train_loss*1.5),
+                       arrowprops=dict(arrowstyle='->', color='blue', alpha=0.7),
+                       fontsize=10, color='blue')
+            
+            if val_losses and len(val_losses) == len(train_losses):
+                ax.annotate(f'Final Val Loss: {final_val_loss:.6f}', 
+                           xy=(total_epochs, final_val_loss), 
+                           xytext=(total_epochs*0.7, final_val_loss*0.5),
+                           arrowprops=dict(arrowstyle='->', color='red', alpha=0.7),
+                           fontsize=10, color='red')
+            
+            # Save with high quality
+            fig.savefig(os.path.join(plots_dir, 'loss_curve.png'), 
+                       dpi=300, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+            
+            # Save training metadata
+            metadata = {
+                'final_train_loss': final_train_loss,
+                'final_val_loss': final_val_loss,
+                'total_epochs': total_epochs,
+                'training_completed_at': datetime.now().isoformat(),
+                'ticker': self.get_ticker_from_filename(),
+                'model_directory': model_dir,
+                'data_file': self.data_file,
+                'x_features': self.x_features,
+                'y_feature': self.y_feature,
+                'hidden_size': self.hidden_size_var.get(),
+                'learning_rate': self.learning_rate_var.get(),
+                'batch_size': self.batch_size_var.get(),
+                'patience': self.patience_var.get()
+            }
+            
+            with open(os.path.join(model_dir, 'training_metadata.json'), 'w') as f:
+                json.dump(metadata, f, indent=2)
             
             # Refresh models list
             self.refresh_models()
@@ -1412,26 +1730,323 @@ class StockPredictionGUI:
             # Update plots tab
             self.update_plots_tab(train_losses, val_losses)
             
-            # Create 3D gradient descent visualization
-            self.create_3d_gradient_descent_visualization(train_losses)
-            
-            # Switch to 3D gradient descent tab (index 4)
-            self.switch_to_tab(4)
-            
-            # Show success message
-            messagebox.showinfo("Success", f"Model training completed successfully!\nModel saved in: {model_dir}\n3D gradient descent visualization created!")
-            
             # Set the newly created model as selected
             self.selected_model_path = model_dir
+            self.load_saved_plots()
+            
+            # Automatically generate 3D gradient descent visualization
+            self.status_var.set("Generating 3D gradient descent visualization...")
+            self.root.update()
+            
+            try:
+                # Generate 3D visualization automatically
+                success, stdout, stderr = script_launcher.launch_gradient_descent(
+                    model_dir=model_dir,
+                    save_png=True,
+                    color='viridis',
+                    point_size=8,
+                    line_width=2,
+                    surface_alpha=0.6
+                )
+                
+                if success:
+                    # Update the 3D Gradient Descent tab with the visualization
+                    self.update_3d_gradient_descent_tab()
+                    # Refresh saved plots to include the new 3D visualization
+                    self.load_saved_plots()
+                    
+                    # Switch to 3D Gradient Descent tab to show the visualization
+                    self.switch_to_tab(4)  # 3D Gradient Descent tab index
+                    
+                    # Enhanced success message with 3D visualization info
+                    success_msg = f"Model training completed successfully!\n\n"
+                    success_msg += f"📊 Training Statistics:\n"
+                    success_msg += f"   • Total Epochs: {total_epochs}\n"
+                    success_msg += f"   • Final Training Loss: {final_train_loss:.6f}\n"
+                    if val_losses and len(val_losses) == len(train_losses):
+                        success_msg += f"   • Final Validation Loss: {final_val_loss:.6f}\n"
+                    success_msg += f"   • Model saved in: {model_dir}\n"
+                    success_msg += f"   • Loss plot saved to: {plots_dir}/loss_curve.png\n"
+                    success_msg += f"   • 3D visualization generated and displayed!\n\n"
+                    success_msg += f"🎯 The 3D Gradient Descent tab now shows your training visualization!"
+                    
+                    messagebox.showinfo("Training Success", success_msg)
+                else:
+                    # Fallback success message without 3D visualization
+                    success_msg = f"Model training completed successfully!\n\n"
+                    success_msg += f"📊 Training Statistics:\n"
+                    success_msg += f"   • Total Epochs: {total_epochs}\n"
+                    success_msg += f"   • Final Training Loss: {final_train_loss:.6f}\n"
+                    if val_losses and len(val_losses) == len(train_losses):
+                        success_msg += f"   • Final Validation Loss: {final_val_loss:.6f}\n"
+                    success_msg += f"   • Model saved in: {model_dir}\n"
+                    success_msg += f"   • Loss plot saved to: {plots_dir}/loss_curve.png\n\n"
+                    success_msg += f"💡 Tip: Use the 'Create 3D Visualization' button to generate gradient descent plots!"
+                    
+                    messagebox.showinfo("Training Success", success_msg)
+                    
+            except Exception as viz_error:
+                print(f"Error generating 3D visualization: {viz_error}")
+                # Continue with normal success message even if 3D visualization fails
+                success_msg = f"Model training completed successfully!\n\n"
+                success_msg += f"📊 Training Statistics:\n"
+                success_msg += f"   • Total Epochs: {total_epochs}\n"
+                success_msg += f"   • Final Training Loss: {final_train_loss:.6f}\n"
+                if val_losses and len(val_losses) == len(train_losses):
+                    success_msg += f"   • Final Validation Loss: {final_val_loss:.6f}\n"
+                success_msg += f"   • Model saved in: {model_dir}\n"
+                success_msg += f"   • Loss plot saved to: {plots_dir}/loss_curve.png\n\n"
+                success_msg += f"💡 Tip: Use the 'Create 3D Visualization' button to generate gradient descent plots!"
+                
+                messagebox.showinfo("Training Success", success_msg)
+            
+            # Log completion
+            print(f"✅ Training completed - Epochs: {total_epochs}, Final Loss: {final_train_loss:.6f}")
             
         except Exception as e:
-            print(f"Error in training completion: {e}")
+            error_msg = f"Error in training completion: {e}"
+            print(error_msg)
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
             messagebox.showerror("Error", f"Error updating results: {str(e)}")
+            
+            # Ensure UI is reset even on error
+            self.stop_button.config(state=tk.DISABLED)
+            self.train_button.config(state=tk.NORMAL)
+            self.progress_bar.configure(value=0)
 
     def _enable_train_button(self):
         """Re-enable the train button"""
         self.train_button.config(state=tk.NORMAL)
         self.status_var.set("Ready")
+
+    def stop_training(self):
+        """Stop the training process"""
+        self.is_training = False
+        self.train_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        self.status_var.set("Training stopped")
+        # Reset progress bar
+        self.progress_bar.configure(value=0)
+
+    def clear_plot_cache(self):
+        """Clear the plot image cache to free memory."""
+        self.plot_image_cache.clear()
+        print("Plot image cache cleared")
+        self.status_var.set("Plot cache cleared")
+        self.update_cache_info()
+
+    def update_cache_info(self):
+        """Update the cache info label."""
+        cache_size = len(self.plot_image_cache)
+        self.cache_info_label.config(text=f"Cache: {cache_size} images")
+        if cache_size > 0:
+            self.cache_info_label.config(foreground="green")
+        else:
+            self.cache_info_label.config(foreground="blue")
+
+    def load_saved_plots(self):
+        """Load and display PNG plots from the selected model's plots directory with optimizations."""
+        # Cancel any ongoing plot loading operations
+        self.cancel_plot_loading()
+        
+        # Submit the plot loading task to thread pool
+        future = self.thread_pool.submit(self._load_saved_plots_worker)
+        self.plot_futures['load_saved_plots'] = future
+        
+        # Schedule a callback to update the GUI when done
+        self.root.after(100, self._check_plot_loading_complete, 'load_saved_plots')
+
+    def _load_saved_plots_worker(self):
+        """Worker function to load plots in background thread."""
+        try:
+            # Clear existing images
+            for widget in self.saved_plots_inner_frame.winfo_children():
+                widget.destroy()
+            
+            if not self.selected_model_path:
+                self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                        text="Select a model to view saved plots", 
+                                                        foreground='black', background='white')
+                self.saved_plots_placeholder.pack(pady=20)
+                return {'success': True, 'message': 'No model selected'}
+            
+            plots_dir = os.path.join(self.selected_model_path, 'plots')
+            if not os.path.exists(plots_dir):
+                self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                        text="No plots directory found in model directory", 
+                                                        foreground='black', background='white')
+                self.saved_plots_placeholder.pack(pady=20)
+                return {'success': False, 'message': 'No plots directory found'}
+            
+            plot_files = sorted(glob.glob(os.path.join(plots_dir, '*.png')))
+            if not plot_files:
+                self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                        text="No PNG plots found in model directory", 
+                                                        foreground='black', background='white')
+                self.saved_plots_placeholder.pack(pady=20)
+                return {'success': False, 'message': 'No PNG plots found'}
+            
+            # Show loading progress
+            loading_label = ttk.Label(self.saved_plots_inner_frame, 
+                                     text="Loading plots...", 
+                                     foreground='blue', background='white')
+            loading_label.pack(pady=20)
+            
+            # Load and display each PNG with optimizations
+            self.saved_plots_images = []  # Keep references to avoid garbage collection
+            max_width = 600  # Max width for images to fit in GUI
+            max_height = 400  # Max height to prevent oversized images
+            displayed_count = 0
+            
+            # Limit to first 10 plots for performance
+            plot_files_to_load = plot_files[:10]
+            
+            for i, plot_file in enumerate(plot_files_to_load):
+                try:
+                    # Update loading progress
+                    loading_label.config(text=f"Loading plot {i+1}/{len(plot_files_to_load)}...")
+                    
+                    # Check cache first
+                    cache_key = f"{plot_file}_{max_width}_{max_height}"
+                    if cache_key in self.plot_image_cache:
+                        photo = self.plot_image_cache[cache_key]
+                        print(f"Using cached image: {os.path.basename(plot_file)}")
+                    else:
+                        # Load and resize image with faster method
+                        img = Image.open(plot_file)
+                        
+                        # Get original dimensions
+                        img_width, img_height = img.size
+                        
+                        # Calculate optimal scale to fit within bounds
+                        scale_x = max_width / img_width
+                        scale_y = max_height / img_height
+                        scale = min(scale_x, scale_y, 1.0)  # Don't scale up, only down
+                        
+                        # Only resize if necessary
+                        if scale < 1.0:
+                            new_size = (int(img_width * scale), int(img_height * scale))
+                            # Use faster resampling method for better performance
+                            img = img.resize(new_size, Image.Resampling.BILINEAR)
+                        
+                        # Convert to PhotoImage
+                        photo = ImageTk.PhotoImage(img)
+                        
+                        # Cache the image (with size limit)
+                        if len(self.plot_image_cache) >= self.max_cache_size:
+                            # Remove oldest entry (simple FIFO)
+                            oldest_key = next(iter(self.plot_image_cache))
+                            del self.plot_image_cache[oldest_key]
+                        
+                        self.plot_image_cache[cache_key] = photo
+                        print(f"Cached new image: {os.path.basename(plot_file)}")
+                    
+                    # Create frame for this plot
+                    frame = ttk.Frame(self.saved_plots_inner_frame)
+                    frame.pack(pady=5, fill="x", padx=10)
+                    
+                    # Create filename label with better formatting
+                    filename = os.path.basename(plot_file)
+                    filename_label = ttk.Label(frame, text=filename, 
+                                              foreground='black', background='white',
+                                              font=('Arial', 10, 'bold'))
+                    filename_label.pack(anchor="w", pady=(5,2))
+                    
+                    # Create image label
+                    img_label = ttk.Label(frame, image=photo)
+                    img_label.pack(anchor="w")
+                    
+                    # Store reference to prevent garbage collection
+                    self.saved_plots_images.append(photo)
+                    displayed_count += 1
+                    
+                except Exception as img_error:
+                    print(f"Error loading image {plot_file}: {img_error}")
+                    continue
+            
+            # Remove loading label
+            loading_label.destroy()
+            
+            if displayed_count == 0:
+                self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                        text="Error loading all plot images", 
+                                                        foreground='red', background='white')
+                self.saved_plots_placeholder.pack(pady=20)
+                return {'success': False, 'message': 'Error loading plot images'}
+            
+            # Show summary with cache info
+            summary_text = f"Showing {displayed_count} of {len(plot_files)} plots"
+            if len(plot_files) > 10:
+                summary_text += " (showing first 10)"
+            summary_text += f" | Cache: {len(self.plot_image_cache)} images"
+            
+            summary_label = ttk.Label(self.saved_plots_inner_frame, 
+                                     text=summary_text, 
+                                     foreground='blue', background='white')
+            summary_label.pack(pady=5)
+            
+            # Update scroll region
+            self.saved_plots_canvas.configure(scrollregion=self.saved_plots_canvas.bbox("all"))
+            
+            return {
+                'success': True, 
+                'message': f'Loaded {displayed_count} plot(s) from {plots_dir}',
+                'displayed_count': displayed_count,
+                'total_count': len(plot_files)
+            }
+            
+        except Exception as e:
+            self.saved_plots_placeholder = ttk.Label(self.saved_plots_inner_frame, 
+                                                    text=f"Error loading plots: {str(e)}", 
+                                                    foreground='red', background='white')
+            self.saved_plots_placeholder.pack(pady=20)
+            return {'success': False, 'message': f'Error loading plots: {str(e)}'}
+
+    def _check_plot_loading_complete(self, operation_name):
+        """Check if plot loading operation is complete and update GUI."""
+        if operation_name not in self.plot_futures:
+            return
+        
+        future = self.plot_futures[operation_name]
+        if future.done():
+            try:
+                result = future.result()
+                if result['success']:
+                    self.status_var.set(result['message'])
+                    if 'displayed_count' in result:
+                        print(f"Loaded {result['displayed_count']} plot(s) from {result['total_count']} available")
+                        print(f"Image cache size: {len(self.plot_image_cache)}")
+                        self.update_cache_info()
+                else:
+                    self.status_var.set(result['message'])
+                    print(f"Plot loading failed: {result['message']}")
+            except Exception as e:
+                self.status_var.set(f"Error in plot loading: {str(e)}")
+                print(f"Error in plot loading: {e}")
+            finally:
+                # Remove the completed future
+                del self.plot_futures[operation_name]
+        else:
+            # Schedule another check in 100ms
+            self.root.after(100, self._check_plot_loading_complete, operation_name)
+
+    def cancel_plot_loading(self):
+        """Cancel ongoing plot loading operations."""
+        for operation_name, future in list(self.plot_futures.items()):
+            if not future.done():
+                future.cancel()
+                print(f"Cancelled plot loading operation: {operation_name}")
+        self.plot_futures.clear()
+
+    def cleanup_thread_pool(self):
+        """Clean up thread pool on application exit."""
+        try:
+            self.cancel_plot_loading()
+            self.thread_pool.shutdown(wait=False)
+            print("Thread pool cleaned up")
+        except Exception as e:
+            print(f"Error cleaning up thread pool: {e}")
 
     def update_plots_tab(self, train_losses, val_losses):
         """Update the plots tab with comprehensive training results"""
@@ -1548,6 +2163,268 @@ class StockPredictionGUI:
                              fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
             self.gd3d_ax.set_title("3D Gradient Descent Visualization")
             self.gd3d_canvas.draw()
+
+    def trigger_gradient_descent_visualization(self):
+        """Trigger gradient descent visualization and save PNG plots."""
+        if not self.selected_model_path:
+            messagebox.showerror("Error", "Please select a model first")
+            return
+        
+        try:
+            self.status_var.set("Creating gradient descent visualization...")
+            self.root.update()
+            
+            # Configuration options for the visualization
+            config = {
+                'color': 'viridis',
+                'point_size': 8,
+                'line_width': 2,
+                'surface_alpha': 0.6
+            }
+            
+            # Use script launcher to run gradient descent with enhanced options
+            success, stdout, stderr = script_launcher.launch_gradient_descent(
+                model_dir=self.selected_model_path,
+                save_png=True,
+                **config
+            )
+            
+            if success:
+                # Refresh the saved plots tab
+                self.load_saved_plots()
+                # Update the 3D Gradient Descent tab with the latest visualization
+                self.update_3d_gradient_descent_tab()
+                # Switch to 3D Gradient Descent tab to show the visualization
+                self.switch_to_tab(4)  # 3D Gradient Descent tab index
+                self.status_var.set("Gradient descent visualization completed successfully")
+                messagebox.showinfo("Success", 
+                                  "3D gradient descent visualization completed!\n"
+                                  "Check the '3D Gradient Descent' tab to view the visualization.")
+            else:
+                error_msg = stderr if stderr else stdout
+                messagebox.showerror("Error", f"Failed to create visualization:\n{error_msg}")
+                self.status_var.set("Gradient descent visualization failed")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Error creating gradient descent visualization: {str(e)}")
+            self.status_var.set("Error in gradient descent visualization")
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_3d_gradient_descent_tab(self):
+        """Update the 3D Gradient Descent tab with the latest visualization image."""
+        try:
+            if not self.selected_model_path:
+                return
+            
+            plots_dir = os.path.join(self.selected_model_path, 'plots')
+            if not os.path.exists(plots_dir):
+                return
+            
+            # Find the latest gradient descent 3D visualization image
+            gd3d_files = sorted(glob.glob(os.path.join(plots_dir, 'gradient_descent_3d_frame_*.png')))
+            
+            if not gd3d_files:
+                # Fallback to any gradient descent related image
+                gd3d_files = sorted(glob.glob(os.path.join(plots_dir, '*gradient_descent*3d*.png')))
+            
+            if not gd3d_files:
+                # Show placeholder if no 3D visualization found
+                self.gd3d_ax.clear()
+                self.gd3d_ax.text(0.5, 0.5, 0.5, 'No 3D gradient descent visualization found.\nClick "Create 3D Visualization" to generate one.', 
+                                 ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                                 fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+                self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+                self.gd3d_canvas.draw()
+                return
+            
+            # Use the last (most recent) frame or a middle frame for better visualization
+            if len(gd3d_files) > 10:
+                # Use a middle frame for better visualization
+                selected_file = gd3d_files[len(gd3d_files) // 2]
+            else:
+                # Use the last frame
+                selected_file = gd3d_files[-1]
+            
+            # Load and display the image in the 3D tab
+            self.load_3d_visualization_image(selected_file)
+            
+        except Exception as e:
+            print(f"Error updating 3D gradient descent tab: {e}")
+            # Fallback to placeholder
+            self.gd3d_ax.clear()
+            self.gd3d_ax.text(0.5, 0.5, 0.5, f'Error loading 3D visualization: {str(e)}', 
+                             ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                             fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+            self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+            self.gd3d_canvas.draw()
+
+    def load_3d_visualization_image(self, image_path):
+        """Load a 3D visualization image into the 3D Gradient Descent tab."""
+        try:
+            # Clear the 3D plot
+            self.gd3d_ax.clear()
+            
+            # Load the image
+            img = Image.open(image_path)
+            
+            # Get image dimensions
+            img_width, img_height = img.size
+            
+            # Always resize to exactly 75% of original size
+            scale = 0.75
+            
+            # Resize the image to 75% of original size
+            new_size = (int(img_width * scale), int(img_height * scale))
+            img = img.resize(new_size, Image.Resampling.BILINEAR)
+            
+            # Convert to numpy array for matplotlib
+            img_array = np.array(img)
+            
+            # Create a 2D plot in the 3D tab (since we're showing a static image)
+            # We'll use a 2D projection to display the 3D visualization image
+            # Adjust extent to center the image better
+            self.gd3d_ax.imshow(img_array, aspect='auto', extent=[-1.5, 1.5, -1.5, 1.5])
+            
+            # Set title with filename
+            filename = os.path.basename(image_path)
+            self.gd3d_ax.set_title(f"3D Gradient Descent Visualization\n{filename}")
+            
+            # Remove axis labels since this is an image
+            self.gd3d_ax.set_xticks([])
+            self.gd3d_ax.set_yticks([])
+            
+            # Add a border
+            self.gd3d_ax.spines['top'].set_visible(True)
+            self.gd3d_ax.spines['right'].set_visible(True)
+            self.gd3d_ax.spines['bottom'].set_visible(True)
+            self.gd3d_ax.spines['left'].set_visible(True)
+            
+            # Draw the plot
+            self.gd3d_canvas.draw()
+            self.gd3d_canvas.flush_events()
+            
+            print(f"Loaded 3D visualization image: {filename} (resized to {new_size[0]}x{new_size[1]} - 75% of original)")
+            
+        except Exception as e:
+            print(f"Error loading 3D visualization image: {e}")
+            # Fallback to error message
+            self.gd3d_ax.clear()
+            self.gd3d_ax.text(0.5, 0.5, 0.5, f'Error loading 3D visualization image: {str(e)}', 
+                             ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                             fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+            self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+            self.gd3d_canvas.draw()
+
+    def _show_gradient_descent(self):
+        """Run gradient_descent_3d.py to generate PNG snapshots and refresh Saved Plots tab."""
+        if not self.selected_model_path:
+            messagebox.showerror("Error", "Please select a model first")
+            return
+        
+        try:
+            self.status_var.set("Generating 3D gradient descent visualization...")
+            self.root.update()
+            
+            # Use script launcher for better path resolution
+            script_path = script_launcher.find_script("gradient_descent_3d.py")
+            if not script_path:
+                messagebox.showerror("Error", "gradient_descent_3d.py not found")
+                self.status_var.set("Error: gradient_descent_3d.py not found")
+                return
+            
+            cmd = [
+                sys.executable, script_path,
+                "--model_dir", self.selected_model_path,
+                "--save_png"
+            ]
+            
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                     cwd=os.path.dirname(script_path))
+            stdout, stderr = process.communicate()
+            
+            if process.returncode == 0:
+                # Refresh the saved plots tab
+                self.load_saved_plots()
+                # Switch to Saved Plots tab (index 1)
+                self.switch_to_tab(1)
+                self.status_var.set("3D gradient descent visualization generated successfully")
+                messagebox.showinfo("Success", 
+                                  "3D gradient descent visualization generated and saved as PNGs.\n"
+                                  "Check the 'Saved Plots' tab to view the results.")
+            else:
+                error_msg = stderr.decode() if stderr else "Unknown error"
+                messagebox.showerror("Error", f"Failed to generate visualization:\n{error_msg}")
+                self.status_var.set(f"Error: {error_msg}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to run visualization: {str(e)}")
+            self.status_var.set(f"Error: {str(e)}")
+
+    def preload_plot_images(self, plot_files, max_width=600, max_height=400):
+        """Preload plot images in the background for better performance."""
+        try:
+            preloaded_count = 0
+            for plot_file in plot_files[:10]:  # Limit to 10 for performance
+                cache_key = f"{plot_file}_{max_width}_{max_height}"
+                if cache_key not in self.plot_image_cache:
+                    try:
+                        # Load and resize image
+                        img = Image.open(plot_file)
+                        img_width, img_height = img.size
+                        
+                        # Calculate optimal scale
+                        scale_x = max_width / img_width
+                        scale_y = max_height / img_height
+                        scale = min(scale_x, scale_y, 1.0)
+                        
+                        # Only resize if necessary
+                        if scale < 1.0:
+                            new_size = (int(img_width * scale), int(img_height * scale))
+                            img = img.resize(new_size, Image.Resampling.BILINEAR)
+                        
+                        # Convert to PhotoImage
+                        photo = ImageTk.PhotoImage(img)
+                        
+                        # Cache the image
+                        if len(self.plot_image_cache) >= self.max_cache_size:
+                            oldest_key = next(iter(self.plot_image_cache))
+                            del self.plot_image_cache[oldest_key]
+                        
+                        self.plot_image_cache[cache_key] = photo
+                        preloaded_count += 1
+                        
+                    except Exception as e:
+                        print(f"Error preloading {plot_file}: {e}")
+                        continue
+            
+            print(f"Preloaded {preloaded_count} images")
+            return preloaded_count
+            
+        except Exception as e:
+            print(f"Error in preload_plot_images: {e}")
+            return 0
+
+    def create_thumbnail(self, image_path, max_width=150, max_height=100):
+        """Create a small thumbnail for faster loading."""
+        try:
+            img = Image.open(image_path)
+            img_width, img_height = img.size
+            
+            # Calculate scale for thumbnail
+            scale_x = max_width / img_width
+            scale_y = max_height / img_height
+            scale = min(scale_x, scale_y, 1.0)
+            
+            if scale < 1.0:
+                new_size = (int(img_width * scale), int(img_height * scale))
+                img = img.resize(new_size, Image.Resampling.BILINEAR)
+            
+            return ImageTk.PhotoImage(img)
+        except Exception as e:
+            print(f"Error creating thumbnail for {image_path}: {e}")
+            return None
 
 def main():
     root = tk.Tk()
