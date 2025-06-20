@@ -503,22 +503,13 @@ class StockNet:
                 print(f"Early stopping at epoch {epoch}")
                 break
                 
-            # Print progress for live plotting
-            # Output format: LOSS:epoch,loss_value
-            print(f"LOSS:{epoch},{avg_mse:.6f}")
-            
-            # Output weight values for gradient descent visualization
-            # Format: WEIGHTS:epoch,w1_avg,w2_avg
-            w1_avg = np.mean(self.W1)
-            w2_avg = np.mean(self.W2)
-            print(f"WEIGHTS:{epoch},{w1_avg:.6f},{w2_avg:.6f}")
-            
-            # Also print detailed progress every 10 epochs
+            # Print progress
             if epoch % 10 == 0:
                 if X_val is not None and y_val is not None:
                     print(f"Epoch {epoch}, Train MSE: {avg_mse:.6f}, Val MSE: {val_mse:.6f}")
                 else:
-                    print(f"Epoch {epoch}, MSE: {avg_mse:.6f}")        
+                    print(f"Epoch {epoch}, MSE: {avg_mse:.6f}")
+        
         return train_losses, val_losses
 
 def load_data_from_directory(directory_path):

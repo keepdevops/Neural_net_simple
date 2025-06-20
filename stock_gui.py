@@ -300,7 +300,7 @@ class StockPredictionGUI:
         self.batch_size_var = tk.StringVar(value="32")  # Default batch size
         
         # Gradient descent visualization parameters
-        self.color_var = tk.StringVar(value="red")
+        self.color_var = tk.StringVar(value="viridis")
         self.point_size_var = tk.StringVar(value="100")
         self.line_width_var = tk.StringVar(value="3")
         self.surface_alpha_var = tk.StringVar(value="0.3")
@@ -465,6 +465,10 @@ class StockPredictionGUI:
         self.train_button = ttk.Button(training_frame, text="Start Training", command=self.start_training)
         self.train_button.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         
+        # Live plot button
+        live_plot_btn = ttk.Button(training_frame, text="Open Live Training Plot", command=self.open_live_training_plot)
+        live_plot_btn.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        
         # Model Management Tab
         model_frame = ttk.Frame(self.control_notebook)
         self.control_notebook.add(model_frame, text="Model Management")
@@ -498,8 +502,10 @@ class StockPredictionGUI:
         color_label = ttk.Label(model_frame, text="Color Map:")
         color_label.grid(row=4, column=0, sticky="w", pady=(0, 5))
         
-        color_entry = ttk.Entry(model_frame, textvariable=self.color_var, width=10)
-        color_entry.grid(row=5, column=0, sticky="w", pady=(0, 10))
+        # Use combobox with valid colormap options
+        valid_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'Reds', 'Blues', 'Greens', 'Oranges', 'Purples', 'RdYlBu', 'RdYlGn', 'Spectral', 'coolwarm', 'jet', 'hot', 'gray', 'bone', 'pink', 'spring', 'summer', 'autumn', 'winter']
+        color_combo = ttk.Combobox(model_frame, textvariable=self.color_var, values=valid_colormaps, width=15, state="readonly")
+        color_combo.grid(row=5, column=0, sticky="w", pady=(0, 10))
         
         # Point size
         point_label = ttk.Label(model_frame, text="Point Size:")
@@ -627,6 +633,10 @@ class StockPredictionGUI:
             self.train_button.config(state=tk.DISABLED)
             self.status_var.set("Starting training...")
             
+            # Clear previous training log
+            self.clear_training_log()
+            self.append_training_log("=== Starting New Training Session ===\n")
+            
             # Start training in a separate thread
             self.training_thread = threading.Thread(target=self._train_model)
             self.training_thread.daemon = True
@@ -638,9 +648,31 @@ class StockPredictionGUI:
             self.train_button.config(state=tk.NORMAL)
             self.status_var.set(f"Error starting training: {str(e)}")
 
+    def append_training_log(self, line):
+        """Safely append a line to the training log text widget."""
+        try:
+            self.training_log_text.config(state="normal")
+            self.training_log_text.insert("end", line)
+            self.training_log_text.see("end")
+            self.training_log_text.config(state="disabled")
+        except Exception as e:
+            print(f"Error appending to training log: {e}")
+
+    def clear_training_log(self):
+        """Clear the training log text widget."""
+        try:
+            self.training_log_text.config(state="normal")
+            self.training_log_text.delete(1.0, tk.END)
+            self.training_log_text.config(state="disabled")
+        except Exception as e:
+            print(f"Error clearing training log: {e}")
+
     def _train_model(self):
         """Train the model (runs in separate thread)."""
         try:
+            # Clear the training log
+            self.root.after(0, self.clear_training_log)
+            
             # Get training parameters
             hidden_size = int(self.hidden_size_var.get())
             learning_rate = float(self.learning_rate_var.get())
@@ -658,7 +690,7 @@ class StockPredictionGUI:
             
             y_feature = self.target_combo.get()
             
-            # Run training using subprocess (stock_net.train_model doesn't exist)
+            # Build command
             cmd = [
                 sys.executable, 'stock_net.py',
                 '--data_file', self.data_file,
@@ -669,17 +701,47 @@ class StockPredictionGUI:
                 '--batch_size', str(batch_size)
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise Exception(f"Training failed: {result.stderr}")
+            # Start training process with live output
+            self.root.after(0, lambda: self.append_training_log(f"Starting training with command: {' '.join(cmd)}\n"))
+            
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            # Read output line by line
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    # Update GUI with the line
+                    self.root.after(0, lambda l=line: self.append_training_log(l))
+                    
+                    # Parse line for loss information and update live plot
+                    self.root.after(0, lambda l=line: self.parse_training_output_for_loss(l))
+            
+            # Wait for process to complete
+            return_code = process.wait()
+            
+            if return_code != 0:
+                error_msg = f"Training failed with return code {return_code}"
+                self.root.after(0, lambda: self.append_training_log(f"\n{error_msg}\n"))
+                raise Exception(error_msg)
             
             # Training completed successfully
+            self.root.after(0, lambda: self.append_training_log("\nTraining completed successfully!\n"))
             self.root.after(0, self._training_completed_success)
             
         except Exception as e:
             print(f"Error in training: {e}")
             # Fix lambda scoping issue by capturing the exception variable
             error_msg = str(e)
+            self.root.after(0, lambda: self.append_training_log(f"\nError: {error_msg}\n"))
             self.root.after(0, lambda: self._training_completed_error(error_msg))
 
     def _training_completed_success(self):
@@ -688,6 +750,12 @@ class StockPredictionGUI:
         self.train_button.config(state=tk.NORMAL)
         self.status_var.set("Training completed successfully!")
         self.refresh_models()
+        # Display model info and training plots after training
+        self._load_model_info()
+        self.display_training_plots()
+        # Close live plot if it's open
+        if self.live_plot_window_open:
+            self.close_live_plot()
         messagebox.showinfo("Success", "Model training completed successfully!")
 
     def _training_completed_error(self, error_msg):
@@ -695,6 +763,9 @@ class StockPredictionGUI:
         self.is_training = False
         self.train_button.config(state=tk.NORMAL)
         self.status_var.set(f"Training failed: {error_msg}")
+        # Close live plot if it's open
+        if self.live_plot_window_open:
+            self.close_live_plot()
         messagebox.showerror("Training Error", f"Training failed: {error_msg}")
 
     def make_prediction(self):
@@ -739,6 +810,19 @@ class StockPredictionGUI:
         try:
             self.status_var.set("Creating 3D visualization...")
             
+            # Start 3D visualization in a separate thread
+            self.visualization_thread = threading.Thread(target=self._create_3d_visualization_thread)
+            self.visualization_thread.daemon = True
+            self.visualization_thread.start()
+            
+        except Exception as e:
+            print(f"Error starting 3D visualization: {e}")
+            self.status_var.set(f"Error starting 3D visualization: {str(e)}")
+            messagebox.showerror("3D Visualization Error", f"Error starting 3D visualization: {str(e)}")
+
+    def _create_3d_visualization_thread(self):
+        """Create 3D gradient descent visualization (runs in separate thread)."""
+        try:
             # Get visualization parameters
             color = self.color_var.get()
             point_size = int(self.point_size_var.get())
@@ -756,18 +840,42 @@ class StockPredictionGUI:
                 '--save_png'
             ]
             
+            print(f"Running 3D visualization command: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise Exception(f"3D visualization failed: {result.stderr}")
             
-            self.status_var.set("3D visualization created successfully!")
-            self.refresh_models()  # Refresh to show new plots
-            messagebox.showinfo("Success", "3D visualization created successfully!")
+            print(f"3D visualization return code: {result.returncode}")
+            print(f"3D visualization stdout: {result.stdout}")
+            print(f"3D visualization stderr: {result.stderr}")
+            
+            if result.returncode != 0:
+                error_msg = result.stderr if result.stderr else "Unknown error occurred"
+                raise Exception(f"3D visualization failed: {error_msg}")
+            
+            # Check if any PNG files were created
+            plots_dir = os.path.join(self.selected_model_path, 'plots')
+            if os.path.exists(plots_dir):
+                png_files = glob.glob(os.path.join(plots_dir, '*.png'))
+                print(f"Found {len(png_files)} PNG files in plots directory")
+            
+            # 3D visualization completed successfully
+            self.root.after(0, self._3d_visualization_completed_success)
             
         except Exception as e:
             print(f"Error creating 3D visualization: {e}")
-            self.status_var.set(f"3D visualization failed: {str(e)}")
-            messagebox.showerror("3D Visualization Error", f"3D visualization failed: {str(e)}")
+            # Fix lambda scoping issue by capturing the exception variable
+            error_msg = str(e) if str(e) else "Unknown error occurred"
+            self.root.after(0, lambda: self._3d_visualization_completed_error(error_msg))
+
+    def _3d_visualization_completed_success(self):
+        """Handle successful 3D visualization completion."""
+        self.status_var.set("3D visualization created successfully!")
+        self.refresh_models()  # Refresh to show new plots
+        messagebox.showinfo("Success", "3D visualization created successfully!")
+
+    def _3d_visualization_completed_error(self, error_msg):
+        """Handle 3D visualization completion with error."""
+        self.status_var.set(f"3D visualization failed: {error_msg}")
+        messagebox.showerror("3D Visualization Error", f"3D visualization failed: {error_msg}")
 
     def _load_model_info(self):
         """Load information about the selected model."""
@@ -977,9 +1085,10 @@ class StockPredictionGUI:
         self.display_notebook.add(train_results_frame, text="Training Results")
         train_results_frame.grid_columnconfigure(0, weight=1)
         train_results_frame.grid_rowconfigure(0, weight=1)
+        train_results_frame.grid_rowconfigure(1, weight=1)
         
         # Create matplotlib figure for training results
-        self.results_fig = plt.Figure(figsize=(8, 6))
+        self.results_fig = plt.Figure(figsize=(8, 4))
         self.results_ax = self.results_fig.add_subplot(111)
         
         # Create canvas and embed in the tab using grid
@@ -988,6 +1097,22 @@ class StockPredictionGUI:
         
         # Add toolbar using grid
         toolbar = GridMatplotlibToolbar(self.results_canvas, train_results_frame)
+        
+        # Add live training log text widget
+        log_frame = ttk.LabelFrame(train_results_frame, text="Live Training Log", padding="5")
+        log_frame.grid(row=1, column=0, sticky="nsew", pady=(5, 0))
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create text widget with scrollbar for live training messages
+        self.training_log_text = tk.Text(log_frame, height=8, bg="#222222", fg="#CCCCCC", 
+                                        font=("Consolas", 9), state="disabled")
+        self.training_log_text.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        
+        # Add scrollbar for the text widget
+        log_scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.training_log_text.yview)
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.training_log_text.configure(yscrollcommand=log_scrollbar.set)
         
         # Initialize with a placeholder plot
         self.results_ax.text(0.5, 0.5, 'Training results will appear here', 
@@ -1068,7 +1193,7 @@ class StockPredictionGUI:
         
         # Create matplotlib figure for 3D gradient descent visualization
         self.gd3d_fig = plt.Figure(figsize=(8, 6))
-        self.gd3d_ax = self.gd3d_fig.add_subplot(111, projection='3d')
+        self.gd3d_ax = self.gd3d_fig.add_subplot(111)
         
         # Create canvas and embed in the tab using grid
         self.gd3d_canvas = FigureCanvasTkAgg(self.gd3d_fig, gd3d_frame)
@@ -1078,7 +1203,7 @@ class StockPredictionGUI:
         toolbar = GridMatplotlibToolbar(self.gd3d_canvas, gd3d_frame)
         
         # Initialize with a placeholder plot
-        self.gd3d_ax.text(0.5, 0.5, 0.5, '3D Gradient Descent visualization will appear here after training', 
+        self.gd3d_ax.text(0.5, 0.5, '3D Gradient Descent visualization will appear here after training', 
                           ha='center', va='center', transform=self.gd3d_ax.transAxes,
                           fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
         self.gd3d_ax.set_title("3D Gradient Descent Visualization")
@@ -1116,6 +1241,35 @@ class StockPredictionGUI:
             scrollregion=self.saved_plots_canvas.bbox("all")))
         
         print("Saved Plots tab created successfully")
+        
+        # Live Training Plot Tab (New)
+        live_plot_frame = ttk.Frame(self.display_notebook)
+        self.display_notebook.add(live_plot_frame, text="Live Training Plot")
+        live_plot_frame.grid_columnconfigure(0, weight=1)
+        live_plot_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create frame for live plot controls
+        live_controls_frame = ttk.Frame(live_plot_frame)
+        live_controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        live_controls_frame.grid_columnconfigure(0, weight=1)
+        
+        # Add button to open live plot
+        self.open_live_plot_btn = ttk.Button(live_controls_frame, text="Open Live Training Plot", 
+                                            command=self.open_live_training_plot)
+        self.open_live_plot_btn.grid(row=0, column=0, padx=5, pady=5)
+        
+        # Add status label for live plot
+        self.live_plot_status = ttk.Label(live_controls_frame, text="Click 'Open Live Training Plot' to start monitoring", 
+                                         foreground=TEXT_COLOR, background=FRAME_COLOR)
+        self.live_plot_status.grid(row=1, column=0, padx=5, pady=5)
+        
+        # Initialize live plot variables
+        self.live_plot_fig = None
+        self.live_plot_epochs = []
+        self.live_plot_losses = []
+        self.live_plot_window_open = False
+        
+        print("Live Training Plot tab created successfully")
         
         print(f"Display panel created with {self.display_notebook.index('end')} tabs")
 
@@ -1315,18 +1469,43 @@ class StockPredictionGUI:
         """Update the 3D gradient descent tab with visualization."""
         try:
             if not self.has_3d_visualization():
+                print("No 3D visualization files found")
+                # Show a placeholder message
+                self.gd3d_ax.clear()
+                self.gd3d_ax.text(0.5, 0.5, 'No 3D gradient descent visualization found.\nRun 3D visualization to generate one.', 
+                                ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                                fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+                self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+                self.gd3d_ax.axis('off')
+                self.gd3d_canvas.draw()
                 return
             
             plots_dir = os.path.join(self.selected_model_path, 'plots')
             gd3d_files = sorted(glob.glob(os.path.join(plots_dir, 'gradient_descent_3d_frame_*.png')))
             
+            print(f"Found {len(gd3d_files)} 3D visualization files: {[os.path.basename(f) for f in gd3d_files]}")
+            
             if gd3d_files:
                 # Load the last frame (most complete visualization)
                 latest_frame = gd3d_files[-1]
+                print(f"Loading latest 3D visualization: {os.path.basename(latest_frame)}")
                 self.load_3d_visualization_image(latest_frame)
+            else:
+                print("No 3D visualization files found in plots directory")
+                # Show a placeholder message
+                self.gd3d_ax.clear()
+                self.gd3d_ax.text(0.5, 0.5, 'No 3D gradient descent visualization found.\nRun 3D visualization to generate one.', 
+                                ha='center', va='center', transform=self.gd3d_ax.transAxes,
+                                fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+                self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+                self.gd3d_ax.axis('off')
+                self.gd3d_canvas.draw()
+                
         except Exception as e:
             print(f"Error updating 3D gradient descent tab: {e}")
-    
+            import traceback
+            traceback.print_exc()
+
     def load_3d_visualization_image(self, image_path):
         """Load and display 3D visualization image in the 3D tab."""
         try:
@@ -1339,13 +1518,20 @@ class StockPredictionGUI:
             new_size = (int(img_width * scale), int(img_height * scale))
             img = img.resize(new_size, Image.Resampling.LANCZOS)
             
-            # Convert to PhotoImage
-            photo = ImageTk.PhotoImage(img)
+            # Convert to numpy array for matplotlib
+            img_array = np.array(img)
             
             # Clear the 3D axis and display the image
             self.gd3d_ax.clear()
-            self.gd3d_ax.imshow(np.array(img))
-            self.gd3d_ax.set_title("3D Gradient Descent Visualization")
+            
+            # Use imshow to display the image properly
+            # The image array should be in the format (height, width, channels)
+            if len(img_array.shape) == 3:  # RGB image
+                self.gd3d_ax.imshow(img_array)
+            else:  # Grayscale image
+                self.gd3d_ax.imshow(img_array, cmap='gray')
+            
+            self.gd3d_ax.set_title(f"3D Gradient Descent Visualization\n{os.path.basename(image_path)}")
             self.gd3d_ax.axis('off')
             
             # Refresh the canvas
@@ -1355,6 +1541,8 @@ class StockPredictionGUI:
             
         except Exception as e:
             print(f"Error loading 3D visualization image: {e}")
+            import traceback
+            traceback.print_exc()
 
     def display_plotly_loss(self, train_losses=None, val_losses=None):
         """Display interactive loss plot using plotly if available."""
@@ -1423,6 +1611,149 @@ class StockPredictionGUI:
         except Exception as e:
             print(f"Error creating plotly plot: {e}")
             messagebox.showerror("Error", f"Failed to create interactive plot: {str(e)}")
+
+    def open_live_training_plot(self):
+        """Open a live training plot window using Plotly."""
+        if not PLOTLY_AVAILABLE:
+            messagebox.showwarning("Plotly Not Available", 
+                                 "Plotly is not installed. Please install it with 'pip install plotly' to use live plots.")
+            return
+        
+        try:
+            # Initialize live plot data
+            self.live_plot_epochs = []
+            self.live_plot_losses = []
+            self.live_plot_window_open = True
+            
+            # Create initial plotly figure
+            self.live_plot_fig = go.Figure()
+            self.live_plot_fig.add_trace(go.Scatter(
+                x=self.live_plot_epochs,
+                y=self.live_plot_losses,
+                mode='lines+markers',
+                name='Training Loss',
+                line=dict(color='blue', width=2),
+                marker=dict(size=6)
+            ))
+            
+            # Update layout
+            ticker = self.get_ticker_from_filename()
+            self.live_plot_fig.update_layout(
+                title=f'Live Training Loss ({ticker})',
+                xaxis_title='Epoch',
+                yaxis_title='Loss',
+                hovermode='x unified',
+                showlegend=True,
+                template='plotly_white',
+                updatemenus=[{
+                    'type': 'buttons',
+                    'showactive': False,
+                    'buttons': [{
+                        'label': 'Pause',
+                        'method': 'relayout',
+                        'args': [{'updatemenus[0].buttons[0].label': 'Resume'}]
+                    }]
+                }]
+            )
+            
+            # Show the plot
+            self.live_plot_fig.show()
+            
+            self.live_plot_status.config(text="Live training plot opened. Training progress will be shown here.")
+            print("Live training plot opened successfully")
+            
+        except Exception as e:
+            print(f"Error opening live training plot: {e}")
+            self.live_plot_window_open = False
+            messagebox.showerror("Error", f"Failed to open live training plot: {str(e)}")
+
+    def update_live_plot(self, epoch, loss):
+        """Update the live training plot with new data."""
+        if not self.live_plot_window_open or not PLOTLY_AVAILABLE:
+            return
+        
+        try:
+            # Add new data point
+            self.live_plot_epochs.append(epoch)
+            self.live_plot_losses.append(loss)
+            
+            # Update the plotly figure
+            self.live_plot_fig.data[0].x = self.live_plot_epochs
+            self.live_plot_fig.data[0].y = self.live_plot_losses
+            
+            # Update the plot
+            self.live_plot_fig.update_layout(
+                xaxis=dict(range=[0, max(self.live_plot_epochs) + 1]),
+                yaxis=dict(range=[min(self.live_plot_losses) * 0.95, max(self.live_plot_losses) * 1.05])
+            )
+            
+            # Force update
+            self.live_plot_fig.update()
+            
+            print(f"Live plot updated: Epoch {epoch}, Loss {loss:.6f}")
+            
+        except Exception as e:
+            print(f"Error updating live plot: {e}")
+
+    def parse_training_output_for_loss(self, line):
+        """Parse training output line to extract epoch and loss information."""
+        try:
+            # Look for new LOSS format: "LOSS:epoch,loss_value"
+            loss_pattern = r"LOSS:(\d+),([\d.]+)"
+            match = re.search(loss_pattern, line)
+            if match:
+                epoch = int(match.group(1))
+                loss = float(match.group(2))
+                if self.live_plot_window_open:
+                    self.root.after(0, lambda e=epoch, l=loss: self.update_live_plot(e, l))
+                return epoch, loss
+
+            # Look for new WEIGHTS format: "WEIGHTS:epoch,w1_avg,w2_avg"
+            weights_pattern = r"WEIGHTS:(\d+),([\d.-]+),([\d.-]+)"
+            match = re.search(weights_pattern, line)
+            if match:
+                epoch = int(match.group(1))
+                w1_avg = float(match.group(2))
+                w2_avg = float(match.group(3))
+                if not hasattr(self, "live_gd_weights"):
+                    self.live_gd_weights = []
+                self.live_gd_weights.append([w1_avg, w2_avg])
+                # Optionally update a live gradient descent plot here
+                return epoch, None
+
+            # Legacy patterns
+            epoch_pattern = r'Epoch\s+(\d+)/(\d+),\s+Loss:\s+([\d.]+)'
+            match = re.search(epoch_pattern, line)
+            if match:
+                epoch = int(match.group(1))
+                total_epochs = int(match.group(2))
+                loss = float(match.group(3))
+                if self.live_plot_window_open:
+                    self.root.after(0, lambda e=epoch, l=loss: self.update_live_plot(e, l))
+                return epoch, loss
+
+            alt_pattern = r'epoch\s+(\d+)\s+loss:\s+([\d.]+)'
+            match = re.search(alt_pattern, line)
+            if match:
+                epoch = int(match.group(1))
+                loss = float(match.group(2))
+                if self.live_plot_window_open:
+                    self.root.after(0, lambda e=epoch, l=loss: self.update_live_plot(e, l))
+                return epoch, loss
+
+            return None, None
+        except Exception as e:
+            print(f"Error parsing training output: {e}")
+            return None, None
+
+    def close_live_plot(self):
+        """Close the live training plot."""
+        self.live_plot_window_open = False
+        self.live_plot_fig = None
+        self.live_plot_epochs = []
+        self.live_plot_losses = []
+        self.live_plot_status.config(text="Live training plot closed.")
+        print("Live training plot closed")
 
 # Main execution
 if __name__ == "__main__":
