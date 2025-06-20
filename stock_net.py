@@ -73,6 +73,111 @@ def sigmoid_derivative(x):
     """
     return np.clip(x * (1 - x), 1e-8, 1.0)
 
+def relu(x):
+    """
+    Rectified Linear Unit (ReLU) activation function.
+    
+    ReLU(x) = max(0, x)
+    
+    Args:
+        x (numpy.ndarray): Input array of any shape
+        
+    Returns:
+        numpy.ndarray: ReLU activation of the input, same shape as x
+    """
+    return np.maximum(0, x)
+
+def relu_derivative(x):
+    """
+    Derivative of ReLU activation function.
+    
+    The derivative of ReLU(x) is 1 if x > 0, 0 otherwise.
+    
+    Args:
+        x (numpy.ndarray): Input array (should be pre-activation values)
+        
+    Returns:
+        numpy.ndarray: Derivative of ReLU, same shape as x
+    """
+    return np.where(x > 0, 1, 0)
+
+def compute_rsi(prices, period=14):
+    """
+    Compute Relative Strength Index (RSI) for a price series.
+    
+    RSI = 100 - (100 / (1 + RS))
+    where RS = Average Gain / Average Loss
+    
+    Args:
+        prices (pandas.Series): Price series
+        period (int): Period for RSI calculation (default: 14)
+        
+    Returns:
+        pandas.Series: RSI values
+    """
+    # Calculate price changes
+    delta = prices.diff()
+    
+    # Separate gains and losses
+    gains = delta.where(delta > 0, 0)
+    losses = -delta.where(delta < 0, 0)
+    
+    # Calculate average gains and losses using exponential moving average
+    avg_gains = gains.ewm(span=period, adjust=False).mean()
+    avg_losses = losses.ewm(span=period, adjust=False).mean()
+    
+    # Calculate RS and RSI
+    rs = avg_gains / avg_losses
+    rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+def add_technical_indicators(df):
+    """
+    Add technical indicators to the dataframe.
+    
+    Args:
+        df (pandas.DataFrame): DataFrame with OHLCV data
+        
+    Returns:
+        pandas.DataFrame: DataFrame with added technical indicators
+    """
+    # Make a copy to avoid modifying original
+    df_enhanced = df.copy()
+    
+    # Moving averages
+    df_enhanced['ma_5'] = df_enhanced['close'].rolling(window=5).mean()
+    df_enhanced['ma_10'] = df_enhanced['close'].rolling(window=10).mean()
+    df_enhanced['ma_20'] = df_enhanced['close'].rolling(window=20).mean()
+    
+    # RSI
+    df_enhanced['rsi'] = compute_rsi(df_enhanced['close'], 14)
+    
+    # Price changes
+    df_enhanced['price_change'] = df_enhanced['close'].pct_change()
+    df_enhanced['price_change_5'] = df_enhanced['close'].pct_change(periods=5)
+    
+    # Volatility (rolling standard deviation)
+    df_enhanced['volatility_10'] = df_enhanced['close'].rolling(window=10).std()
+    
+    # Bollinger Bands
+    df_enhanced['bb_middle'] = df_enhanced['close'].rolling(window=20).mean()
+    bb_std = df_enhanced['close'].rolling(window=20).std()
+    df_enhanced['bb_upper'] = df_enhanced['bb_middle'] + (bb_std * 2)
+    df_enhanced['bb_lower'] = df_enhanced['bb_middle'] - (bb_std * 2)
+    
+    # MACD
+    exp1 = df_enhanced['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df_enhanced['close'].ewm(span=26, adjust=False).mean()
+    df_enhanced['macd'] = exp1 - exp2
+    df_enhanced['macd_signal'] = df_enhanced['macd'].ewm(span=9, adjust=False).mean()
+    
+    # Volume indicators
+    df_enhanced['volume_ma'] = df_enhanced['vol'].rolling(window=10).mean()
+    df_enhanced['volume_ratio'] = df_enhanced['vol'] / df_enhanced['volume_ma']
+    
+    return df_enhanced
+
 class StockNet:
     """
     Neural network for stock price prediction.
@@ -84,10 +189,11 @@ class StockNet:
     
     Features:
     - Xavier/Glorot weight initialization
-    - Momentum-based optimization
+    - Adam optimizer with adaptive learning rates
     - Mini-batch training
     - Early stopping
     - Weight saving/loading
+    - Support for both sigmoid and ReLU activation functions
     """
     
     def __init__(self, input_size, hidden_size=4, output_size=1):
@@ -105,12 +211,25 @@ class StockNet:
         self.W2 = np.random.randn(hidden_size, output_size) * np.sqrt(2.0 / hidden_size)
         self.b2 = np.zeros((1, output_size))
         
-        # Initialize momentum parameters
-        self.momentum = 0.9
+        # Adam optimizer parameters
+        self.beta1 = 0.9  # First moment decay rate
+        self.beta2 = 0.999  # Second moment decay rate
+        self.epsilon = 1e-8  # Small constant for numerical stability
+        
+        # Initialize Adam moment variables (first moment - mean)
+        self.m_W1 = np.zeros_like(self.W1)
+        self.m_b1 = np.zeros_like(self.b1)
+        self.m_W2 = np.zeros_like(self.W2)
+        self.m_b2 = np.zeros_like(self.b2)
+        
+        # Initialize Adam moment variables (second moment - variance)
         self.v_W1 = np.zeros_like(self.W1)
         self.v_b1 = np.zeros_like(self.b1)
         self.v_W2 = np.zeros_like(self.W2)
         self.v_b2 = np.zeros_like(self.b2)
+        
+        # Initialize time step for bias correction
+        self.t = 0
         
         # Initialize normalization parameters
         self.X_min = None
@@ -212,6 +331,11 @@ class StockNet:
             model.b1 = data['b1']
             model.W2 = data['W2']
             model.b2 = data['b2']
+            
+            # Validate weight shapes for consistency
+            if model.W1.shape[1] != model.b1.shape[1] or model.W2.shape[0] != model.W1.shape[1]:
+                raise ValueError("Inconsistent weight shapes in model")
+            
             model.X_min = data['X_min']
             model.X_max = data['X_max']
             model.Y_min = data['Y_min']
@@ -240,7 +364,7 @@ class StockNet:
 
     def backward(self, X, y, output, learning_rate=0.001):
         """
-        Backward pass to update weights and biases.
+        Backward pass to update weights and biases using Adam optimizer.
         
         Args:
             X (numpy.ndarray): Input data of shape (n_samples, n_features)
@@ -255,38 +379,75 @@ class StockNet:
         self.delta2 = np.clip(self.error, -1, 1)  # Output layer error
         self.delta1 = np.clip(np.dot(self.delta2, self.W2.T) * sigmoid_derivative(self.a1), -1, 1)  # Hidden layer error
 
-        # Compute gradients with momentum
+        # Compute gradients
         dW2 = np.dot(self.a1.T, self.delta2) / m
         db2 = np.sum(self.delta2, axis=0, keepdims=True) / m
         dW1 = np.dot(X.T, self.delta1) / m
         db1 = np.sum(self.delta1, axis=0, keepdims=True) / m
 
-        # Update weights and biases with momentum
-        self.v_W1 = self.momentum * self.v_W1 + learning_rate * dW1
-        self.v_b1 = self.momentum * self.v_b1 + learning_rate * db1
-        self.v_W2 = self.momentum * self.v_W2 + learning_rate * dW2
-        self.v_b2 = self.momentum * self.v_b2 + learning_rate * db2
+        # Increment time step
+        self.t += 1
 
-        self.W1 += self.v_W1
-        self.b1 += self.v_b1
-        self.W2 += self.v_W2
-        self.b2 += self.v_b2
+        # Update first moment (mean) estimates
+        self.m_W1 = self.beta1 * self.m_W1 + (1 - self.beta1) * dW1
+        self.m_b1 = self.beta1 * self.m_b1 + (1 - self.beta1) * db1
+        self.m_W2 = self.beta1 * self.m_W2 + (1 - self.beta1) * dW2
+        self.m_b2 = self.beta1 * self.m_b2 + (1 - self.beta1) * db2
 
-    def train(self, X, y, epochs=1000, learning_rate=0.001, batch_size=32):
+        # Update second moment (variance) estimates
+        self.v_W1 = self.beta2 * self.v_W1 + (1 - self.beta2) * (dW1 ** 2)
+        self.v_b1 = self.beta2 * self.v_b1 + (1 - self.beta2) * (db1 ** 2)
+        self.v_W2 = self.beta2 * self.v_W2 + (1 - self.beta2) * (dW2 ** 2)
+        self.v_b2 = self.beta2 * self.v_b2 + (1 - self.beta2) * (db2 ** 2)
+
+        # Bias correction
+        m_W1_corrected = self.m_W1 / (1 - self.beta1 ** self.t)
+        m_b1_corrected = self.m_b1 / (1 - self.beta1 ** self.t)
+        m_W2_corrected = self.m_W2 / (1 - self.beta1 ** self.t)
+        m_b2_corrected = self.m_b2 / (1 - self.beta1 ** self.t)
+
+        v_W1_corrected = self.v_W1 / (1 - self.beta2 ** self.t)
+        v_b1_corrected = self.v_b1 / (1 - self.beta2 ** self.t)
+        v_W2_corrected = self.v_W2 / (1 - self.beta2 ** self.t)
+        v_b2_corrected = self.v_b2 / (1 - self.beta2 ** self.t)
+
+        # Update weights and biases with Adam
+        self.W1 += learning_rate * m_W1_corrected / (np.sqrt(v_W1_corrected) + self.epsilon)
+        self.b1 += learning_rate * m_b1_corrected / (np.sqrt(v_b1_corrected) + self.epsilon)
+        self.W2 += learning_rate * m_W2_corrected / (np.sqrt(v_W2_corrected) + self.epsilon)
+        self.b2 += learning_rate * m_b2_corrected / (np.sqrt(v_b2_corrected) + self.epsilon)
+
+    def train(self, X, y, X_val=None, y_val=None, epochs=1000, learning_rate=0.001, batch_size=32, save_history=True, history_interval=10):
         """
         Train the neural network using mini-batch gradient descent with early stopping.
         
         Args:
             X (numpy.ndarray): Training data
             y (numpy.ndarray): Target values
+            X_val (numpy.ndarray): Validation data (optional)
+            y_val (numpy.ndarray): Validation target values (optional)
             epochs (int): Maximum number of training epochs
             learning_rate (float): Learning rate for weight updates
             batch_size (int): Size of mini-batches for training
+            save_history (bool): Whether to save weight history for visualization
+            history_interval (int): How often to save weight history (every N epochs)
+            
+        Returns:
+            tuple: (train_losses, val_losses) containing loss history
         """
         n_samples = X.shape[0]
         best_mse = float('inf')
         patience = 20  # Number of epochs to wait for improvement
         patience_counter = 0
+        
+        # Initialize loss tracking
+        train_losses = []
+        val_losses = []
+        
+        # Create weights history directory if saving history
+        if save_history:
+            weights_history_dir = os.path.join(os.getcwd(), "weights_history")
+            os.makedirs(weights_history_dir, exist_ok=True)
         
         for epoch in range(epochs):
             # Shuffle data for each epoch
@@ -314,10 +475,26 @@ class StockNet:
             
             # Calculate average MSE for the epoch
             avg_mse = total_mse / n_batches
+            train_losses.append(avg_mse)
+            
+            # Calculate validation loss if validation data is provided
+            if X_val is not None and y_val is not None:
+                val_output = self.forward(X_val)
+                val_mse = np.mean((val_output - y_val) ** 2)
+                val_losses.append(val_mse)
+                current_mse = val_mse  # Use validation loss for early stopping
+            else:
+                val_losses.append(avg_mse)  # Use training loss as validation loss
+                current_mse = avg_mse
+            
+            # Save weight history at regular intervals
+            if save_history and (epoch % history_interval == 0 or epoch == epochs - 1):
+                history_file = os.path.join(weights_history_dir, f"weights_history_{epoch:04d}.npz")
+                np.savez(history_file, W1=self.W1, W2=self.W2)
             
             # Early stopping check
-            if avg_mse < best_mse:
-                best_mse = avg_mse
+            if current_mse < best_mse:
+                best_mse = current_mse
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -328,7 +505,12 @@ class StockNet:
                 
             # Print progress
             if epoch % 10 == 0:
-                print(f"Epoch {epoch}, MSE: {avg_mse:.6f}")
+                if X_val is not None and y_val is not None:
+                    print(f"Epoch {epoch}, Train MSE: {avg_mse:.6f}, Val MSE: {val_mse:.6f}")
+                else:
+                    print(f"Epoch {epoch}, MSE: {avg_mse:.6f}")
+        
+        return train_losses, val_losses
 
 def load_data_from_directory(directory_path):
     """
@@ -445,7 +627,7 @@ if __name__ == "__main__":
                        help="Learning rate for training")
     parser.add_argument("--batch_size", type=int, default=32,
                        help="Batch size for training")
-    parser.add_argument("--x_features", type=str, default="open,high,low,close,vol",
+    parser.add_argument("--x_features", type=str, default="open,high,low,close,vol,ma_10,rsi,price_change,volatility_10",
                        help="Comma-separated list of input features")
     parser.add_argument("--y_feature", type=str, default="close",
                        help="Target feature to predict")
@@ -484,6 +666,10 @@ if __name__ == "__main__":
     # Load and prepare data
     print("Loading data...")
     df = pd.read_csv(args.data_file)
+    
+    # Add technical indicators
+    print("Adding technical indicators...")
+    df = add_technical_indicators(df)
     
     # Validate features
     x_features = args.x_features.split(',')
@@ -542,100 +728,35 @@ if __name__ == "__main__":
     })
     training_data.to_csv(os.path.join(model_dir, 'training_data.csv'), index=False)
     
-    # Track training metrics
-    train_losses = []
-    val_losses = []
-    
-    # Create directory for saving weights history
-    weights_dir = os.path.join(model_dir, 'weights_history')
-    if not os.path.exists(weights_dir):
-        os.makedirs(weights_dir)
-    
-    # Save initial weights
-    weights_history = []
-    weights_history.append({
-        'W1': model.W1,
-        'W2': model.W2
-    })
-    np.savez(os.path.join(weights_dir, 'weights_history_0000.npz'), 
-             W1=model.W1, W2=model.W2)
-    
-    # Training parameters
-    epochs = 1000
-    learning_rate = args.learning_rate
-    batch_size = args.batch_size
-    n_samples = X_train.shape[0]
-    best_val_mse = float('inf')
-    patience = 20
-    patience_counter = 0
-    
+    # Train the model with weight history saving
     print("\nTraining model...")
-    for epoch in range(epochs):
-        # Training
-        indices = np.random.permutation(n_samples)
-        total_mse = 0
-        n_batches = 0
-        
-        for start_idx in range(0, n_samples, batch_size):
-            end_idx = min(start_idx + batch_size, n_samples)
-            batch_indices = indices[start_idx:end_idx]
-            
-            X_batch = X_train[batch_indices]
-            y_batch = Y_train[batch_indices]
-            
-            output = model.forward(X_batch)
-            model.backward(X_batch, y_batch, output, learning_rate)
-            
-            batch_mse = np.mean((output - y_batch) ** 2)
-            total_mse += batch_mse
-            n_batches += 1
-        
-        avg_train_mse = total_mse / n_batches
-        train_losses.append(avg_train_mse)
-        
-        # Save weights every 10 epochs
-        if epoch % 10 == 0:
-            weights_history.append({
-                'W1': model.W1,
-                'W2': model.W2
-            })
-            np.savez(os.path.join(weights_dir, f'weights_history_{epoch:04d}.npz'), 
-                     W1=model.W1, W2=model.W2)
-        
-        # Validation
-        val_output = model.forward(X_test)
-        val_mse = np.mean((val_output - Y_test) ** 2)
-        val_losses.append(val_mse)
-        
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-            
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch}, Train MSE: {avg_train_mse:.6f}, Val MSE: {val_mse:.6f}")
+    train_losses, val_losses = model.train(X_train, Y_train, X_val=X_test, y_val=Y_test, epochs=1000, learning_rate=args.learning_rate, 
+                batch_size=args.batch_size, save_history=True, history_interval=10)
     
-    # Save final weights
-    weights_history.append({
-        'W1': model.W1,
-        'W2': model.W2
-    })
-    np.savez(os.path.join(weights_dir, f'weights_history_{epoch:04d}.npz'), 
-             W1=model.W1, W2=model.W2)
+    # Move weights history to model directory
+    if os.path.exists("weights_history"):
+        import shutil
+        weights_history_dir = os.path.join(model_dir, "weights_history")
+        shutil.move("weights_history", weights_history_dir)
+        print(f"Weight history saved to: {weights_history_dir}")
     
     # Save training losses
-    np.savetxt(os.path.join(model_dir, 'training_losses.csv'), train_losses, delimiter=',')
+    np.savetxt(os.path.join(model_dir, 'training_losses.csv'), 
+               np.column_stack((train_losses, val_losses)), delimiter=',')
     
     # Save model weights
     model.save_weights(model_dir, prefix="stock_model")
     
+    # Save simple loss curve plot
+    plots_dir = os.path.join(model_dir, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.savefig(os.path.join(plots_dir, 'loss_curve.png'), dpi=300)
+    plt.close()
+    
     print("\nTraining complete!")
-    print(f"Final validation MSE: {best_val_mse:.6f}")
+    print(f"Final validation MSE: {val_losses[-1]:.6f}")
     print(f"Model directory: {model_dir}")
     print("\nUse predict.py to make predictions on new data.")
     print("Example: python predict.py /Users/porupine/redline/data/gamestop_us.csv --model_dir", model_dir)

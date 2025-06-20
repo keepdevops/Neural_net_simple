@@ -24,7 +24,7 @@ try:
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     from matplotlib.gridspec import GridSpec
     from matplotlib.figure import Figure
     import seaborn as sns
@@ -84,6 +84,112 @@ SUPPORTED_FORMATS = {
     'images': ['.png', '.jpg', '.jpeg', '.tiff', '.bmp'],
     'plots': ['.png', '.pdf', '.svg', '.eps']
 }
+
+class GridMatplotlibToolbar(ttk.Frame):
+    """Custom matplotlib toolbar that uses grid layout instead of pack."""
+    
+    def __init__(self, parent, canvas):
+        super().__init__(parent)
+        self.canvas = canvas
+        self.figure = canvas.figure
+        self._zoom_mode = False
+        self._pan_mode = False
+        self._zoom_cid = None
+        self._pan_cid = None
+        self._press_event = None
+
+        # Create toolbar buttons using grid
+        ttk.Button(self, text="Home", command=self.home).grid(row=0, column=0, padx=2)
+        ttk.Button(self, text="Zoom", command=self.toggle_zoom).grid(row=0, column=1, padx=2)
+        ttk.Button(self, text="Pan", command=self.toggle_pan).grid(row=0, column=2, padx=2)
+        ttk.Button(self, text="Save", command=self.save).grid(row=0, column=3, padx=2)
+
+    def home(self):
+        """Reset the view to the original state."""
+        ax = self.figure.gca()
+        ax.autoscale()
+        self.canvas.draw()
+
+    def toggle_zoom(self):
+        """Toggle zoom mode."""
+        if self._zoom_mode:
+            self._disable_zoom()
+        else:
+            self._disable_pan()
+            self._zoom_mode = True
+            self._zoom_cid = self.canvas.mpl_connect('button_press_event', self._on_zoom_press)
+            self.canvas.get_tk_widget().config(cursor="crosshair")
+
+    def _disable_zoom(self):
+        """Disable zoom mode."""
+        if self._zoom_mode and self._zoom_cid:
+            self.canvas.mpl_disconnect(self._zoom_cid)
+        self._zoom_mode = False
+        self._zoom_cid = None
+        self.canvas.get_tk_widget().config(cursor="arrow")
+
+    def _on_zoom_press(self, event):
+        """Handle zoom press event."""
+        if event.inaxes:
+            ax = event.inaxes
+            x0, y0 = event.xdata, event.ydata
+            def on_release(ev):
+                if ev.inaxes == ax:
+                    x1, y1 = ev.xdata, ev.ydata
+                    ax.set_xlim(min(x0, x1), max(x0, x1))
+                    ax.set_ylim(min(y0, y1), max(y0, y1))
+                    self.canvas.draw()
+                self.canvas.mpl_disconnect(cid_release)
+                self._disable_zoom()
+            cid_release = self.canvas.mpl_connect('button_release_event', on_release)
+
+    def toggle_pan(self):
+        """Toggle pan mode."""
+        if self._pan_mode:
+            self._disable_pan()
+        else:
+            self._disable_zoom()
+            self._pan_mode = True
+            self._pan_cid = self.canvas.mpl_connect('button_press_event', self._on_pan_press)
+            self.canvas.get_tk_widget().config(cursor="fleur")
+
+    def _disable_pan(self):
+        """Disable pan mode."""
+        if self._pan_mode and self._pan_cid:
+            self.canvas.mpl_disconnect(self._pan_cid)
+        self._pan_mode = False
+        self._pan_cid = None
+        self.canvas.get_tk_widget().config(cursor="arrow")
+
+    def _on_pan_press(self, event):
+        """Handle pan press event."""
+        if event.inaxes:
+            ax = event.inaxes
+            self._press_event = event
+            orig_xlim = ax.get_xlim()
+            orig_ylim = ax.get_ylim()
+            def on_motion(ev):
+                if ev.inaxes == ax and self._press_event:
+                    dx = ev.xdata - self._press_event.xdata
+                    dy = ev.ydata - self._press_event.ydata
+                    ax.set_xlim(orig_xlim[0] - dx, orig_xlim[1] - dx)
+                    ax.set_ylim(orig_ylim[0] - dy, orig_ylim[1] - dy)
+                    self.canvas.draw()
+            def on_release(ev):
+                self.canvas.mpl_disconnect(cid_motion)
+                self.canvas.mpl_disconnect(cid_release)
+                self._disable_pan()
+            cid_motion = self.canvas.mpl_connect('motion_notify_event', on_motion)
+            cid_release = self.canvas.mpl_connect('button_release_event', on_release)
+
+    def save(self):
+        """Save the current figure."""
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=[("PNG files", "*.png"), ("PDF files", "*.pdf"), ("SVG files", "*.svg"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.figure.savefig(file_path, dpi=300, bbox_inches='tight')
 
 class DataVisualizationApp:
     """Main application class for data visualization."""
@@ -205,7 +311,7 @@ class DataVisualizationApp:
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         
         # Add toolbar
-        self.toolbar = NavigationToolbar2Tk(self.canvas, display_frame)
+        self.toolbar = GridMatplotlibToolbar(display_frame, self.canvas)
         self.toolbar.grid(row=1, column=0, sticky="ew")
         self.toolbar.update()
         
@@ -291,10 +397,6 @@ class DataVisualizationApp:
     
     def save_plot(self):
         """Save the current plot to file."""
-        if self.current_plot is None:
-            messagebox.showwarning("Warning", "No plot to save")
-            return
-        
         try:
             file_path = filedialog.asksaveasfilename(
                 title="Save Plot",

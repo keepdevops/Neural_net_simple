@@ -146,37 +146,53 @@ def plot_training_loss(ax, info):
 
 def plot_feature_distributions(ax, info):
     """Plot actual feature distributions using histograms."""
+    # COMMENTED OUT: Original robust implementation
+    # if info['x_features'] and 'data_file' in info['metadata']:
+    #     data_file = info['metadata']['data_file']
+    #     if os.path.exists(data_file):
+    #         try:
+    #             df = pd.read_csv(data_file)
+    #             for feature in info['x_features']:
+    #                 if feature in df.columns:
+    #                     ax.hist(df[feature], bins=20, alpha=0.5, label=feature, density=True)
+    #             ax.set_title('Feature Distributions')
+    #             ax.set_xlabel('Value')
+    #             ax.set_ylabel('Density')
+    #             ax.legend()
+    #             ax.grid(True, alpha=0.3)
+    #         except Exception as e:
+    #             ax.text(0.5, 0.5, f'Error loading data: {str(e)}', ha='center', va='center', 
+    #                    transform=ax.transAxes, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+    #             ax.set_title('Feature Distributions (data loading error)')
+    #     else:
+    #         ax.text(0.5, 0.5, 'Data file not found', ha='center', va='center', 
+    #                transform=ax.transAxes, fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+    #         ax.set_title('Feature Distributions (data file not found)')
+    # else:
+    #     # Fallback to simple feature count
+    #     if info['x_features']:
+    #         ax.bar(range(len(info['x_features'])), [1]*len(info['x_features']), tick_label=info['x_features'])
+    #         ax.set_title('Input Features (Count)')
+    #         ax.set_ylabel('Count')
+    #     else:
+    #         ax.text(0.5, 0.5, 'Feature information not available', ha='center', va='center', 
+    #                transform=ax.transAxes, fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    #         ax.set_title('Input Features (not available)')
+    
+    # NEW: Simpler implementation
     if info['x_features'] and 'data_file' in info['metadata']:
         data_file = info['metadata']['data_file']
         if os.path.exists(data_file):
-            try:
-                df = pd.read_csv(data_file)
-                for feature in info['x_features']:
-                    if feature in df.columns:
-                        ax.hist(df[feature], bins=20, alpha=0.5, label=feature, density=True)
-                ax.set_title('Feature Distributions')
-                ax.set_xlabel('Value')
-                ax.set_ylabel('Density')
-                ax.legend()
-                ax.grid(True, alpha=0.3)
-            except Exception as e:
-                ax.text(0.5, 0.5, f'Error loading data: {str(e)}', ha='center', va='center', 
-                       transform=ax.transAxes, fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
-                ax.set_title('Feature Distributions (data loading error)')
+            df = pd.read_csv(data_file)
+            for feature in info['x_features']:
+                if feature in df.columns:
+                    ax.hist(df[feature], bins=20, alpha=0.5, label=feature, density=True)
+            ax.set_title('Feature Distributions')
+            ax.legend()
         else:
-            ax.text(0.5, 0.5, 'Data file not found', ha='center', va='center', 
-                   transform=ax.transAxes, fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
             ax.set_title('Feature Distributions (data file not found)')
     else:
-        # Fallback to simple feature count
-        if info['x_features']:
-            ax.bar(range(len(info['x_features'])), [1]*len(info['x_features']), tick_label=info['x_features'])
-            ax.set_title('Input Features (Count)')
-            ax.set_ylabel('Count')
-        else:
-            ax.text(0.5, 0.5, 'Feature information not available', ha='center', va='center', 
-                   transform=ax.transAxes, fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
-            ax.set_title('Input Features (not available)')
+        ax.set_title('Feature Distributions (not available)')
 
 def plot_normalization_parameters(ax, info):
     """Plot feature normalization parameters (min and range)."""
@@ -275,9 +291,31 @@ def display_plots(model_dir, info, plot_type='all', save_plots=False):
         ax3 = fig.add_subplot(gs[1, 0])
         plot_normalization_parameters(ax3, info)
         
-        # Plot 4: Predictions
+        # Plot 4: Predictions (from prediction files in model directory)
         ax4 = fig.add_subplot(gs[1, 1])
-        plot_predictions(ax4, info)
+        pred_files = glob.glob(os.path.join(model_dir, 'predictions_*.csv'))
+        if pred_files:
+            latest_pred = max(pred_files, key=os.path.getctime)
+            df = pd.read_csv(latest_pred)
+            if 'close' in df.columns and 'predicted_close' in df.columns:
+                ax4.plot(df['close'], label='Actual', alpha=0.7)
+                ax4.plot(df['predicted_close'], label='Predicted', alpha=0.7)
+                ax4.set_title('Actual vs Predicted Prices')
+                ax4.set_xlabel('Sample')
+                ax4.set_ylabel('Price')
+                ax4.legend()
+                ax4.grid(True, alpha=0.3)
+                
+                # Calculate and display error metrics
+                mse = np.mean((df['close'] - df['predicted_close']) ** 2)
+                mae = np.mean(np.abs(df['close'] - df['predicted_close']))
+                ax4.text(0.02, 0.98, f'MSE: {mse:.6f}\nMAE: {mae:.6f}',
+                         transform=ax4.transAxes, va='top',
+                         bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+            else:
+                plot_predictions(ax4, info)  # Fallback to original predictions plot
+        else:
+            plot_predictions(ax4, info)  # Fallback to original predictions plot
         
         # Plot 5: Metadata
         ax5 = fig.add_subplot(gs[2, :])

@@ -93,6 +93,13 @@ def load_training_data(model_dir):
 
 def compute_loss_surface(X, y, w1_range, w2_range, n_points=50):
     """Compute the loss surface for visualization."""
+    # Ensure inputs are numeric
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    
+    print(f"X shape: {X.shape}, X dtype: {X.dtype}")
+    print(f"y shape: {y.shape}, y dtype: {y.dtype}")
+    
     w1 = np.linspace(w1_range[0], w1_range[1], n_points)
     w2 = np.linspace(w2_range[0], w2_range[1], n_points)
     W1, W2 = np.meshgrid(w1, w2)
@@ -100,12 +107,13 @@ def compute_loss_surface(X, y, w1_range, w2_range, n_points=50):
     
     X_viz = X[:, :2] if X.shape[1] > 2 else X
     print(f"Using first 2 features out of {X.shape[1]} for visualization")
+    print(f"X_viz shape: {X_viz.shape}, X_viz dtype: {X_viz.dtype}")
     
     for i in range(n_points):
         for j in range(n_points):
-            w = np.array([[W1[i, j]], [W2[i, j]]])
+            w = np.array([[W1[i, j]], [W2[i, j]]], dtype=np.float64)
             if w.shape[0] != X_viz.shape[1]:
-                w = np.vstack([w, np.zeros((X_viz.shape[1] - w.shape[0], 1))])
+                w = np.vstack([w, np.zeros((X_viz.shape[1] - w.shape[0], 1), dtype=np.float64)])
             y_pred = X_viz @ w
             Z[i, j] = np.mean((y - y_pred) ** 2)
     
@@ -132,16 +140,30 @@ class GradientDescentVisualizer:
         
         data_file = os.path.join(self.model_dir, "training_data.csv")
         if os.path.exists(data_file):
-            df = pd.read_csv(data_file)
-            X = df[self.norm_params['x_features']].values
-            y = df[self.norm_params['y_feature']].values.reshape(-1, 1)
-            self.X = X
-            self.y = y
-            self.has_training_data = True
+            try:
+                df = pd.read_csv(data_file)
+                # Ensure we only use numeric columns
+                x_features = [f for f in self.norm_params['x_features'] if f in df.columns and df[f].dtype in ['int64', 'float64']]
+                if not x_features:
+                    raise ValueError("No numeric features found in training data")
+                
+                X = df[x_features].values.astype(np.float64)
+                y = df[self.norm_params['y_feature']].values.astype(np.float64).reshape(-1, 1)
+                self.X = X
+                self.y = y
+                self.has_training_data = True
+                print(f"Loaded training data with {X.shape[0]} samples and {X.shape[1]} features")
+            except Exception as e:
+                print(f"Error loading training data: {e}, creating synthetic visualization...")
+                self.X = np.random.randn(100, len(self.norm_params['x_features']))
+                self.y = np.random.randn(100, 1)
+                self.has_training_data = False
         else:
             print(f"Training data not found in {self.model_dir}, creating synthetic visualization...")
-            self.X = np.random.randn(100, len(self.norm_params['x_features']))
-            self.y = np.random.randn(100, 1)
+            # Create synthetic data with proper numeric types
+            n_features = max(2, len(self.norm_params['x_features']))
+            self.X = np.random.randn(100, n_features).astype(np.float64)
+            self.y = np.random.randn(100, 1).astype(np.float64)
             self.has_training_data = False
         
         self.W1, self.W2, self.Z = compute_loss_surface(self.X, self.y, w1_range, w2_range, n_points)
@@ -198,21 +220,44 @@ class GradientDescentVisualizer:
             self.end_point.set_data([], [])
             self.end_point.set_3d_properties([])
         
+        # Get weights for current frame with better error handling
         weights = self.history['weights'][min(frame, len(self.history['weights']) - 1)]
-        w1 = weights['W1'][0, 0] if weights['W1'].size > 0 else 0.0
-        w2 = weights['W2'][0, 0] if weights['W2'].size > 0 else 0.0
+        
+        # Extract weights with proper shape handling
+        try:
+            w1 = weights['W1'].flatten()[0] if weights['W1'].size > 0 else 0.0
+            w2 = weights['W2'].flatten()[0] if weights['W2'].size > 0 else 0.0
+        except (IndexError, KeyError) as e:
+            print(f"Warning: Could not extract weights for frame {frame}: {e}")
+            w1, w2 = 0.0, 0.0
+        
         loss = self.history['losses'][frame]
         
-        # Collect path data
-        x = [w['W1'][0, 0] for w in self.history['weights'][:frame + 1] 
-             if w['W1'].size > 0]
-        y = [w['W2'][0, 0] for w in self.history['weights'][:frame + 1] 
-             if w['W2'].size > 0]
+        # Collect path data with better error handling
+        x, y = [], []
+        for i in range(min(frame + 1, len(self.history['weights']))):
+            try:
+                w = self.history['weights'][i]
+                x.append(w['W1'].flatten()[0] if w['W1'].size > 0 else 0.0)
+                y.append(w['W2'].flatten()[0] if w['W2'].size > 0 else 0.0)
+            except (IndexError, KeyError) as e:
+                print(f"Warning: Could not extract weights for path point {i}: {e}")
+                x.append(0.0)
+                y.append(0.0)
+        
         z = self.history['losses'][:frame + 1]
         
+        # Ensure we have the same number of points
+        while len(z) < len(x):
+            z.append(z[-1] if z else 0.0)
+        while len(x) < len(z):
+            x.append(x[-1] if x else 0.0)
+            y.append(y[-1] if y else 0.0)
+        
         # Update loss path
-        self.progress_line.set_data(x, y)
-        self.progress_line.set_3d_properties(z)
+        if x and y and z:
+            self.progress_line.set_data(x, y)
+            self.progress_line.set_3d_properties(z)
         
         # Update current position
         self.current_point.set_data([w1], [w2])
@@ -237,48 +282,65 @@ class GradientDescentVisualizer:
         return (self.progress_line, self.current_point, self.start_point, self.end_point, self.text)
 
     def save_plots(self, frames=[0, None, -1], plots_dir=None):
-        """Save PNG snapshots of the visualization at specified frames."""
+        """Save PNG snapshots of the visualization at specified frames using grid layout."""
         if plots_dir is None:
             plots_dir = os.path.join(self.model_dir, 'plots')
         os.makedirs(plots_dir, exist_ok=True)
         
+        # If None is provided, use middle frame
         if None in frames:
             frames[frames.index(None)] = len(self.history['losses']) // 2
         
         for frame in frames:
             if frame < 0:
                 frame = len(self.history['losses']) + frame
-            if frame >= len(self.history['losses']) or frame < 0:
+            if frame >= len(self.history['losses']):
                 continue
             
+            # Update the plot for this frame
             self.update(frame)
+            
+            # Save the figure
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f'gradient_descent_3d_frame_{frame}_{timestamp}.png'
             filepath = os.path.join(plots_dir, filename)
-            self.fig.savefig(filepath, dpi=100, bbox_inches='tight')
+            self.fig.savefig(filepath, dpi=300, bbox_inches='tight')
             print(f"Saved plot: {filepath}")
 
     def animate(self, save_png=False):
-        """Create and display the animation, optionally saving PNGs."""
+        """Create and display the animation, optionally saving PNGs using grid layout."""
         if save_png:
+            # Save plots at initial, middle, and final frames
             self.save_plots(frames=[0, None, -1])
         
-        self.animation = animation.FuncAnimation(
-            self.fig, self.update,
-            frames=len(self.history['losses']),
-            interval=1000/self.fps,
-            blit=False,
-            repeat=True
-        )
+        # For PNG saving, don't show the animation
+        if save_png:
+            print("PNG snapshots saved. Animation not displayed in save mode.")
+            return
         
-        plt.show()
+        # Create animation with proper settings for 3D plots
+        try:
+            self.animation = animation.FuncAnimation(
+                self.fig, self.update,
+                frames=len(self.history['losses']),
+                interval=1000/self.fps,
+                blit=False,  # Keep False for 3D plots
+                repeat=True
+            )
+            
+            plt.show()
+        except Exception as e:
+            print(f"Error creating animation: {e}")
+            # Fallback: just show the final frame
+            self.update(len(self.history['losses']) - 1)
+            plt.show()
 
 def main():
     parser = argparse.ArgumentParser(description='3D Gradient Descent Visualization')
     parser.add_argument('--model_dir', type=str, help='Directory containing the model files')
     parser.add_argument('--color', type=str, default='viridis', help='Color map for the surface')
     parser.add_argument('--point_size', type=int, default=8, help='Size of the current point marker')
-    parser.add_argument('--line_width', type=int, default=3, help='Width of the gradient descent path')
+    parser.add_argument('--line_width', type=int, default=2, help='Width of the gradient descent path')
     parser.add_argument('--surface_alpha', type=float, default=0.6, help='Alpha transparency of the surface')
     parser.add_argument('--w1_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 1')
     parser.add_argument('--w2_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 2')
@@ -287,14 +349,14 @@ def main():
     parser.add_argument('--view_azim', type=float, default=45, help='Initial azimuth angle')
     parser.add_argument('--fps', type=int, default=30, help='Frames per second for animation')
     parser.add_argument('--save_png', action='store_true', help='Save PNG snapshots of visualization')
-    parser.add_argument('--output_resolution', type=int, nargs=2, default=[1200, 800], 
-                       help='Output resolution for PNGs (width height)')
     
     args = parser.parse_args()
     
+    model_dir = args.model_dir or find_latest_model_dir()
+    
     try:
         visualizer = GradientDescentVisualizer(
-            model_dir=args.model_dir,
+            model_dir=model_dir,
             w1_range=tuple(args.w1_range),
             w2_range=tuple(args.w2_range),
             n_points=args.n_points,
@@ -304,8 +366,7 @@ def main():
             color=args.color,
             point_size=args.point_size,
             line_width=args.line_width,
-            surface_alpha=args.surface_alpha,
-            output_resolution=tuple(args.output_resolution)
+            surface_alpha=args.surface_alpha
         )
         visualizer.animate(save_png=args.save_png)
     except Exception as e:
