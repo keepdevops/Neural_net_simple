@@ -12,7 +12,7 @@ Features:
 """
 
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 import os
 import sys
 import subprocess
@@ -35,14 +35,20 @@ from PIL import Image, ImageTk
 import path_utils
 import script_launcher
 from matplotlib.animation import FuncAnimation
+import matplotlib.animation as animation
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import queue
+import io
 
-# Optional plotly import
+# Import the data converter
 try:
-    import plotly.graph_objects as go
-    PLOTLY_AVAILABLE = True
+    from data_converter import convert_data_file, detect_data_format
+    DATA_CONVERTER_AVAILABLE = True
 except ImportError:
-    PLOTLY_AVAILABLE = False
-    print("Plotly not available. Interactive plots will be disabled.")
+    DATA_CONVERTER_AVAILABLE = False
+    print("⚠️  Data converter not available - manual data conversion may be required")
+
 
 # Custom NavigationToolbar that uses grid instead of pack
 class GridMatplotlibToolbar(NavigationToolbar2Tk):
@@ -50,8 +56,16 @@ class GridMatplotlibToolbar(NavigationToolbar2Tk):
         # Create a frame to hold the toolbar
         self.toolbar_frame = tk.Frame(window)
         super().__init__(canvas, self.toolbar_frame)
-        # Use grid instead of pack for the toolbar frame
-        self.toolbar_frame.grid(row=1, column=0, sticky="ew")
+        
+        # Do not automatically place the toolbar - let the calling code control placement
+        # The calling code should call: toolbar.grid(row=X, column=0, sticky="ew")
+        
+        # Configure the parent window to handle the toolbar frame properly
+        window.grid_columnconfigure(0, weight=1)  # Column should expand
+        
+        # Ensure the toolbar frame itself uses grid properly
+        self.toolbar_frame.grid_columnconfigure(0, weight=1)
+        
         # Do not create custom buttons; NavigationToolbar2Tk handles this
 
 # Import stock_net module
@@ -240,9 +254,116 @@ HOVER_COLOR = "#666666"      # Hover effect
 class StockPredictionGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Stock Price Prediction System")
-        self.root.geometry("1600x900")  # Increased window size
+        self.root.title("Stock Prediction Neural Network GUI")
+        self.root.geometry("1400x900")
         
+        # Set up the main window
+        self.setup_main_window()
+        
+        # Initialize variables
+        self.data_file = None
+        self.output_dir = None
+        self.selected_model_path = None
+        self.training_process = None
+        self.visualization_process = None
+        
+        # Training variables
+        self.epochs_var = tk.StringVar(value="100")
+        self.learning_rate_var = tk.StringVar(value="0.001")
+        self.batch_size_var = tk.StringVar(value="32")
+        self.validation_split_var = tk.StringVar(value="0.2")
+        
+        # Feature selection variables
+        self.feature_vars = {}
+        self.locked_features = set()
+        
+        # Status variables
+        self.status_var = tk.StringVar(value="Ready")  # Status bar variable
+        self.feature_status_var = tk.StringVar(value="")  # Feature status variable
+        self.prediction_status_var = tk.StringVar(value="No prediction data")  # Prediction status variable
+        
+        # Selected prediction file
+        self.selected_prediction_file = None
+        
+        # Live plot variables with rate limiting
+        self.live_plot_fig = None
+        self.live_plot_epochs = []
+        self.live_plot_losses = []
+        self.live_plot_window_open = False
+        self.last_plot_update = 0  # Timestamp of last plot update
+        self.plot_update_interval = 0.1  # Minimum seconds between updates
+        
+        # 3D visualization variables
+        self.gd3d_fig = None
+        self.gd3d_ax = None
+        self.gd3d_canvas = None
+        
+        # 3D animation variables
+        self.animation_running = False
+        self.current_frame = 0
+        self.total_frames = 0
+        self.anim_speed_var = tk.DoubleVar(value=1.0)
+        
+        # Model directory
+        self.current_model_dir = "."
+        
+        # Image cache for saved plots
+        self.image_cache = {}
+        self.max_cache_size = 10
+        
+        # Thread pool for background tasks
+        self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        
+        # Test script availability
+        self.test_script_availability()
+        
+        # Create GUI components
+        self.create_control_panel()
+        self.create_display_panel()
+        
+        # Load initial data
+        self.refresh_models(load_plots=False)
+        
+        # Cleanup on window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def on_closing(self):
+        """Handle cleanup when the GUI window is closed."""
+        try:
+            # Stop any ongoing training
+            if self.is_training and self.training_thread and self.training_thread.is_alive():
+                print("Stopping training thread...")
+                self.is_training = False
+                self.training_thread.join(timeout=2)
+            
+            # Close live training plot if open
+            if hasattr(self, 'live_plot_window_open') and self.live_plot_window_open:
+                self.close_live_plot()
+            
+            # Clean up thread pool
+            if hasattr(self, 'thread_pool'):
+                self.thread_pool.shutdown(wait=False)
+            
+            # Cancel any pending plot loading operations
+            if hasattr(self, 'plot_futures'):
+                for future in self.plot_futures.values():
+                    if not future.done():
+                        future.cancel()
+            
+            print("Thread pool cleaned up")
+            
+            # Destroy the root window
+            self.root.destroy()
+            
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            # Force destroy even if cleanup fails
+            try:
+                self.root.destroy()
+            except:
+                pass
+
+    def setup_main_window(self):
         # Configure root window style
         self.root.configure(bg=BACKGROUND_COLOR)
         
@@ -301,13 +422,28 @@ class StockPredictionGUI:
         
         # Gradient descent visualization parameters
         self.color_var = tk.StringVar(value="viridis")
-        self.point_size_var = tk.StringVar(value="100")
+        self.point_size_var = tk.StringVar(value="8")
         self.line_width_var = tk.StringVar(value="3")
-        self.surface_alpha_var = tk.StringVar(value="0.3")
+        self.surface_alpha_var = tk.StringVar(value="0.6")
+        
+        # Additional 3D visualization parameters
+        self.w1_range_min_var = tk.StringVar(value="-2.0")
+        self.w1_range_max_var = tk.StringVar(value="2.0")
+        self.w2_range_min_var = tk.StringVar(value="-2.0")
+        self.w2_range_max_var = tk.StringVar(value="2.0")
+        self.n_points_var = tk.StringVar(value="30")
+        self.view_elev_var = tk.StringVar(value="30.0")
+        self.view_azim_var = tk.StringVar(value="45.0")
+        self.fps_var = tk.StringVar(value="30")
+        self.w1_index_var = tk.StringVar(value="0")
+        self.w2_index_var = tk.StringVar(value="0")
+        self.output_width_var = tk.StringVar(value="1200")
+        self.output_height_var = tk.StringVar(value="800")
         
         # Status variables
         self.status_var = tk.StringVar(value="Ready")  # Status bar variable
         self.feature_status_var = tk.StringVar(value="")  # Feature status variable
+        self.prediction_status_var = tk.StringVar(value="No prediction data")  # Prediction status variable
         
         # Selected prediction file
         self.selected_prediction_file = None
@@ -327,7 +463,7 @@ class StockPredictionGUI:
         self.create_display_panel()
         
         # Initialize model list
-        self.refresh_models()
+        self.refresh_models(load_plots=False)
 
     def test_script_availability(self):
         """Test if all required scripts are available and log the results."""
@@ -466,8 +602,12 @@ class StockPredictionGUI:
         self.train_button.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         
         # Live plot button
-        live_plot_btn = ttk.Button(training_frame, text="Open Live Training Plot", command=self.open_live_training_plot)
+        live_plot_btn = ttk.Button(training_frame, text="Open Live Training Plot (Matplotlib)", command=self.open_live_training_plot)
         live_plot_btn.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        
+        # Cache clear button
+        self.cache_clear_btn = ttk.Button(training_frame, text="Clear Cache", command=self.clear_cache_only)
+        self.cache_clear_btn.grid(row=8, column=0, sticky="ew", pady=(10, 0))
         
         # Model Management Tab
         model_frame = ttk.Frame(self.control_notebook)
@@ -494,43 +634,423 @@ class StockPredictionGUI:
         predict_btn = ttk.Button(model_btn_frame, text="Make Prediction", command=self.make_prediction)
         predict_btn.grid(row=0, column=1, padx=(5, 0))
         
-        # 3D Visualization parameters
-        gd3d_label = ttk.Label(model_frame, text="3D Visualization Parameters:", style="Bold.TLabel")
-        gd3d_label.grid(row=3, column=0, sticky="w", pady=(20, 5))
+        # Prediction Files Section
+        pred_files_label = ttk.Label(model_frame, text="Prediction Files:", style="Bold.TLabel")
+        pred_files_label.grid(row=3, column=0, sticky="w", pady=(20, 5))
         
-        # Color map
-        color_label = ttk.Label(model_frame, text="Color Map:")
-        color_label.grid(row=4, column=0, sticky="w", pady=(0, 5))
+        # Create frame for prediction files listbox and scrollbar
+        pred_files_frame = ttk.Frame(model_frame)
+        pred_files_frame.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        pred_files_frame.grid_columnconfigure(0, weight=1)
+        pred_files_frame.grid_rowconfigure(0, weight=1)
         
-        # Use combobox with valid colormap options
-        valid_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'Reds', 'Blues', 'Greens', 'Oranges', 'Purples', 'RdYlBu', 'RdYlGn', 'Spectral', 'coolwarm', 'jet', 'hot', 'gray', 'bone', 'pink', 'spring', 'summer', 'autumn', 'winter']
-        color_combo = ttk.Combobox(model_frame, textvariable=self.color_var, values=valid_colormaps, width=15, state="readonly")
-        color_combo.grid(row=5, column=0, sticky="w", pady=(0, 10))
+        # Prediction files listbox
+        self.prediction_files_listbox = tk.Listbox(pred_files_frame, height=6, selectmode=tk.SINGLE)
+        self.prediction_files_listbox.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.prediction_files_listbox.bind('<<ListboxSelect>>', self.on_prediction_file_select)
         
-        # Point size
-        point_label = ttk.Label(model_frame, text="Point Size:")
-        point_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
+        # Scrollbar for prediction files
+        pred_files_scrollbar = ttk.Scrollbar(pred_files_frame, orient="vertical", command=self.prediction_files_listbox.yview)
+        pred_files_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.prediction_files_listbox.configure(yscrollcommand=pred_files_scrollbar.set)
         
-        point_entry = ttk.Entry(model_frame, textvariable=self.point_size_var, width=10)
-        point_entry.grid(row=7, column=0, sticky="w", pady=(0, 10))
+        # Prediction files buttons
+        pred_files_btn_frame = ttk.Frame(model_frame)
+        pred_files_btn_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        pred_files_btn_frame.grid_columnconfigure(0, weight=1)
+        pred_files_btn_frame.grid_columnconfigure(1, weight=1)
         
-        # Line width
-        line_label = ttk.Label(model_frame, text="Line Width:")
-        line_label.grid(row=8, column=0, sticky="w", pady=(0, 5))
+        refresh_pred_btn = ttk.Button(pred_files_btn_frame, text="Refresh Prediction Files", command=self.refresh_prediction_files)
+        refresh_pred_btn.grid(row=0, column=0, padx=(0, 5))
         
-        line_entry = ttk.Entry(model_frame, textvariable=self.line_width_var, width=10)
-        line_entry.grid(row=9, column=0, sticky="w", pady=(0, 10))
-        
-        # Surface alpha
-        alpha_label = ttk.Label(model_frame, text="Surface Alpha:")
-        alpha_label.grid(row=10, column=0, sticky="w", pady=(0, 5))
-        
-        alpha_entry = ttk.Entry(model_frame, textvariable=self.surface_alpha_var, width=10)
-        alpha_entry.grid(row=11, column=0, sticky="w", pady=(0, 10))
+        view_pred_btn = ttk.Button(pred_files_btn_frame, text="View Prediction Results", command=self.view_prediction_results)
+        view_pred_btn.grid(row=0, column=1, padx=(5, 0))
         
         # 3D Visualization button
         gd3d_btn = ttk.Button(model_frame, text="Create 3D Visualization", command=self.create_3d_visualization)
-        gd3d_btn.grid(row=12, column=0, sticky="ew", pady=(10, 0))
+        gd3d_btn.grid(row=6, column=0, sticky="ew", pady=(10, 0))
+        
+        # Plot Controls Tab
+        plot_controls_frame = ttk.Frame(self.control_notebook)
+        self.control_notebook.add(plot_controls_frame, text="Plot Controls")
+        plot_controls_frame.grid_columnconfigure(0, weight=1)
+        plot_controls_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create a scrollable canvas for Plot Controls
+        plot_canvas = tk.Canvas(plot_controls_frame, bg='white')
+        plot_scrollbar = ttk.Scrollbar(plot_controls_frame, orient="vertical", command=plot_canvas.yview)
+        plot_scrollable_frame = ttk.Frame(plot_canvas)
+        
+        plot_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: plot_canvas.configure(scrollregion=plot_canvas.bbox("all"))
+        )
+        
+        plot_canvas.create_window((0, 0), window=plot_scrollable_frame, anchor="nw")
+        plot_canvas.configure(yscrollcommand=plot_scrollbar.set)
+        
+        # Grid the canvas and scrollbar
+        plot_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        plot_scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Configure canvas scrolling with mouse wheel
+        def _on_mousewheel(event):
+            plot_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        plot_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        # 3D Visualization parameters
+        gd3d_label = ttk.Label(plot_scrollable_frame, text="3D Visualization Parameters:", style="Bold.TLabel")
+        gd3d_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
+        
+        # Create a simple frame for 3D parameters (no scrollbar)
+        gd3d_inner_frame = ttk.Frame(plot_scrollable_frame)
+        gd3d_inner_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        gd3d_inner_frame.grid_columnconfigure(0, weight=1)
+        
+        # Color map
+        color_label = ttk.Label(gd3d_inner_frame, text="Color Map:")
+        color_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
+        
+        # Use combobox with valid colormap options
+        valid_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'Reds', 'Blues', 'Greens', 'Oranges', 'Purples', 'RdYlBu', 'RdYlGn', 'Spectral', 'coolwarm', 'jet', 'hot', 'gray', 'bone', 'pink', 'spring', 'summer', 'autumn', 'winter']
+        color_combo = ttk.Combobox(gd3d_inner_frame, textvariable=self.color_var, values=valid_colormaps, width=15, state="readonly")
+        color_combo.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        
+        # Point size
+        point_label = ttk.Label(gd3d_inner_frame, text="Point Size:")
+        point_label.grid(row=2, column=0, sticky="w", pady=(0, 5))
+        
+        point_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.point_size_var, width=10)
+        point_entry.grid(row=3, column=0, sticky="w", pady=(0, 10))
+        
+        # Line width
+        line_label = ttk.Label(gd3d_inner_frame, text="Line Width:")
+        line_label.grid(row=4, column=0, sticky="w", pady=(0, 5))
+        
+        line_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.line_width_var, width=10)
+        line_entry.grid(row=5, column=0, sticky="w", pady=(0, 10))
+        
+        # Surface alpha
+        alpha_label = ttk.Label(gd3d_inner_frame, text="Surface Alpha:")
+        alpha_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
+        
+        alpha_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.surface_alpha_var, width=10)
+        alpha_entry.grid(row=7, column=0, sticky="w", pady=(0, 10))
+        
+        # Weight ranges
+        w1_range_label = ttk.Label(gd3d_inner_frame, text="W1 Range [min, max]:")
+        w1_range_label.grid(row=8, column=0, sticky="w", pady=(0, 5))
+        
+        w1_range_frame = ttk.Frame(gd3d_inner_frame)
+        w1_range_frame.grid(row=9, column=0, sticky="w", pady=(0, 10))
+        w1_range_frame.grid_columnconfigure(0, weight=1)
+        w1_range_frame.grid_columnconfigure(1, weight=1)
+        
+        w1_min_entry = ttk.Entry(w1_range_frame, textvariable=self.w1_range_min_var, width=8)
+        w1_min_entry.grid(row=0, column=0, padx=(0, 5))
+        
+        w1_max_entry = ttk.Entry(w1_range_frame, textvariable=self.w1_range_max_var, width=8)
+        w1_max_entry.grid(row=0, column=1, padx=(5, 0))
+        
+        w2_range_label = ttk.Label(gd3d_inner_frame, text="W2 Range [min, max]:")
+        w2_range_label.grid(row=10, column=0, sticky="w", pady=(0, 5))
+        
+        w2_range_frame = ttk.Frame(gd3d_inner_frame)
+        w2_range_frame.grid(row=11, column=0, sticky="w", pady=(0, 10))
+        w2_range_frame.grid_columnconfigure(0, weight=1)
+        w2_range_frame.grid_columnconfigure(1, weight=1)
+        
+        w2_min_entry = ttk.Entry(w2_range_frame, textvariable=self.w2_range_min_var, width=8)
+        w2_min_entry.grid(row=0, column=0, padx=(0, 5))
+        
+        w2_max_entry = ttk.Entry(w2_range_frame, textvariable=self.w2_range_max_var, width=8)
+        w2_max_entry.grid(row=0, column=1, padx=(5, 0))
+        
+        # Grid points
+        n_points_label = ttk.Label(gd3d_inner_frame, text="Grid Points:")
+        n_points_label.grid(row=12, column=0, sticky="w", pady=(0, 5))
+        
+        n_points_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.n_points_var, width=10)
+        n_points_entry.grid(row=13, column=0, sticky="w", pady=(0, 10))
+        
+        # View angles
+        view_elev_label = ttk.Label(gd3d_inner_frame, text="View Elevation:")
+        view_elev_label.grid(row=14, column=0, sticky="w", pady=(0, 5))
+        
+        view_elev_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.view_elev_var, width=10)
+        view_elev_entry.grid(row=15, column=0, sticky="w", pady=(0, 10))
+        
+        view_azim_label = ttk.Label(gd3d_inner_frame, text="View Azimuth:")
+        view_azim_label.grid(row=16, column=0, sticky="w", pady=(0, 5))
+        
+        view_azim_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.view_azim_var, width=10)
+        view_azim_entry.grid(row=17, column=0, sticky="w", pady=(0, 10))
+        
+        # FPS
+        fps_label = ttk.Label(gd3d_inner_frame, text="FPS:")
+        fps_label.grid(row=18, column=0, sticky="w", pady=(0, 5))
+        
+        fps_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.fps_var, width=10)
+        fps_entry.grid(row=19, column=0, sticky="w", pady=(0, 10))
+        
+        # Weight indices
+        w1_index_label = ttk.Label(gd3d_inner_frame, text="W1 Index:")
+        w1_index_label.grid(row=20, column=0, sticky="w", pady=(0, 5))
+        
+        w1_index_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.w1_index_var, width=10)
+        w1_index_entry.grid(row=21, column=0, sticky="w", pady=(0, 10))
+        
+        w2_index_label = ttk.Label(gd3d_inner_frame, text="W2 Index:")
+        w2_index_label.grid(row=22, column=0, sticky="w", pady=(0, 5))
+        
+        w2_index_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.w2_index_var, width=10)
+        w2_index_entry.grid(row=23, column=0, sticky="w", pady=(0, 10))
+        
+        # Output resolution
+        output_res_label = ttk.Label(gd3d_inner_frame, text="Output Resolution [width, height]:")
+        output_res_label.grid(row=24, column=0, sticky="w", pady=(0, 5))
+        
+        output_res_frame = ttk.Frame(gd3d_inner_frame)
+        output_res_frame.grid(row=25, column=0, sticky="w", pady=(0, 10))
+        output_res_frame.grid_columnconfigure(0, weight=1)
+        output_res_frame.grid_columnconfigure(1, weight=1)
+        
+        output_width_entry = ttk.Entry(output_res_frame, textvariable=self.output_width_var, width=8)
+        output_width_entry.grid(row=0, column=0, padx=(0, 5))
+        
+        output_height_entry = ttk.Entry(output_res_frame, textvariable=self.output_height_var, width=8)
+        output_height_entry.grid(row=0, column=1, padx=(5, 0))
+        
+        # 3D Visualization Parameters Section
+        gd3d_params_label = ttk.Label(plot_scrollable_frame, text="3D Visualization Parameters:", style="Bold.TLabel")
+        gd3d_params_label.grid(row=2, column=0, sticky="w", pady=(20, 5))
+        
+        # Create frame for 3D parameters
+        gd3d_params_frame = ttk.Frame(plot_scrollable_frame)
+        gd3d_params_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        gd3d_params_frame.grid_columnconfigure(0, weight=1)
+        gd3d_params_frame.grid_columnconfigure(1, weight=1)
+        
+        # Animation Speed Control
+        anim_speed_label = ttk.Label(gd3d_params_frame, text="Animation Speed:")
+        anim_speed_label.grid(row=0, column=0, sticky="w", pady=(5, 2))
+        
+        self.anim_speed_var = tk.DoubleVar(value=1.0)
+        anim_speed_scale = ttk.Scale(gd3d_params_frame, from_=0.1, to=5.0, variable=self.anim_speed_var, 
+                                    orient="horizontal", length=150)
+        anim_speed_scale.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        
+        anim_speed_value_label = ttk.Label(gd3d_params_frame, textvariable=self.anim_speed_var)
+        anim_speed_value_label.grid(row=0, column=1, sticky="e", padx=(0, 10))
+        
+        # Frame Position Control
+        frame_pos_label = ttk.Label(gd3d_params_frame, text="Frame Position:")
+        frame_pos_label.grid(row=1, column=0, sticky="w", pady=(10, 2))
+        
+        self.frame_pos_var = tk.DoubleVar(value=0.0)
+        frame_pos_scale = ttk.Scale(gd3d_params_frame, from_=0, to=100, variable=self.frame_pos_var, 
+                                   orient="horizontal", length=150, command=self.on_frame_pos_change)
+        frame_pos_scale.grid(row=1, column=1, sticky="w", padx=(10, 0))
+        
+        frame_pos_value_label = ttk.Label(gd3d_params_frame, textvariable=self.frame_pos_var)
+        frame_pos_value_label.grid(row=1, column=1, sticky="e", padx=(0, 10))
+        
+        # View Preset Control (replaced listbox with combobox)
+        view_preset_label = ttk.Label(gd3d_params_frame, text="View Preset:")
+        view_preset_label.grid(row=2, column=0, sticky="w", pady=(10, 2))
+        
+        self.view_preset_var = tk.StringVar(value="Default")
+        view_presets = ["Default", "Top View", "Side View", "Isometric", "Front View", "Back View"]
+        view_preset_combo = ttk.Combobox(gd3d_params_frame, textvariable=self.view_preset_var, 
+                                        values=view_presets, width=15, state="readonly")
+        view_preset_combo.grid(row=2, column=1, sticky="w", padx=(10, 0))
+        view_preset_combo.bind('<<ComboboxSelected>>', self.on_view_preset_change)
+        
+        # X Rotation Control
+        x_rot_label = ttk.Label(gd3d_params_frame, text="X Rotation:")
+        x_rot_label.grid(row=3, column=0, sticky="w", pady=(10, 2))
+        
+        self.x_rotation_var = tk.DoubleVar(value=0.0)
+        x_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.x_rotation_var, 
+                               orient="horizontal", length=150, command=self.on_x_rotation_change)
+        x_rot_scale.grid(row=3, column=1, sticky="w", padx=(10, 0))
+        
+        x_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.x_rotation_var)
+        x_rot_value_label.grid(row=3, column=1, sticky="e", padx=(0, 10))
+        
+        # Y Rotation Control
+        y_rot_label = ttk.Label(gd3d_params_frame, text="Y Rotation:")
+        y_rot_label.grid(row=4, column=0, sticky="w", pady=(10, 2))
+        
+        self.y_rotation_var = tk.DoubleVar(value=0.0)
+        y_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.y_rotation_var, 
+                               orient="horizontal", length=150, command=self.on_y_rotation_change)
+        y_rot_scale.grid(row=4, column=1, sticky="w", padx=(10, 0))
+        
+        y_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.y_rotation_var)
+        y_rot_value_label.grid(row=4, column=1, sticky="e", padx=(0, 10))
+        
+        # Z Rotation Control
+        z_rot_label = ttk.Label(gd3d_params_frame, text="Z Rotation:")
+        z_rot_label.grid(row=5, column=0, sticky="w", pady=(10, 2))
+        
+        self.z_rotation_var = tk.DoubleVar(value=0.0)
+        z_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.z_rotation_var, 
+                               orient="horizontal", length=150, command=self.on_z_rotation_change)
+        z_rot_scale.grid(row=5, column=1, sticky="w", padx=(10, 0))
+        
+        z_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.z_rotation_var)
+        z_rot_value_label.grid(row=5, column=1, sticky="e", padx=(0, 10))
+        
+        # Zoom Control
+        zoom_label = ttk.Label(gd3d_params_frame, text="Zoom Level:")
+        zoom_label.grid(row=6, column=0, sticky="w", pady=(10, 2))
+        
+        self.zoom_var = tk.DoubleVar(value=1.0)
+        zoom_scale = ttk.Scale(gd3d_params_frame, from_=0.1, to=5.0, variable=self.zoom_var, 
+                              orient="horizontal", length=150, command=self.on_zoom_change)
+        zoom_scale.grid(row=6, column=1, sticky="w", padx=(10, 0))
+        
+        zoom_value_label = ttk.Label(gd3d_params_frame, textvariable=self.zoom_var)
+        zoom_value_label.grid(row=6, column=1, sticky="e", padx=(0, 10))
+        
+        # Camera Position Controls
+        camera_label = ttk.Label(gd3d_params_frame, text="Camera Position:", style="Bold.TLabel")
+        camera_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(20, 5))
+        
+        # Camera X position
+        cam_x_label = ttk.Label(gd3d_params_frame, text="Camera X:")
+        cam_x_label.grid(row=8, column=0, sticky="w", pady=(5, 2))
+        
+        self.camera_x_var = tk.DoubleVar(value=0.0)
+        cam_x_scale = ttk.Scale(gd3d_params_frame, from_=-10, to=10, variable=self.camera_x_var, 
+                               orient="horizontal", length=150, command=self.on_camera_x_change)
+        cam_x_scale.grid(row=8, column=1, sticky="w", padx=(10, 0))
+        
+        cam_x_value_label = ttk.Label(gd3d_params_frame, textvariable=self.camera_x_var)
+        cam_x_value_label.grid(row=8, column=1, sticky="e", padx=(0, 10))
+        
+        # Camera Y position
+        cam_y_label = ttk.Label(gd3d_params_frame, text="Camera Y:")
+        cam_y_label.grid(row=9, column=0, sticky="w", pady=(5, 2))
+        
+        self.camera_y_var = tk.DoubleVar(value=0.0)
+        cam_y_scale = ttk.Scale(gd3d_params_frame, from_=-10, to=10, variable=self.camera_y_var, 
+                               orient="horizontal", length=150, command=self.on_camera_y_change)
+        cam_y_scale.grid(row=9, column=1, sticky="w", padx=(10, 0))
+        
+        cam_y_value_label = ttk.Label(gd3d_params_frame, textvariable=self.camera_y_var)
+        cam_y_value_label.grid(row=9, column=1, sticky="e", padx=(0, 10))
+        
+        # Camera Z position
+        cam_z_label = ttk.Label(gd3d_params_frame, text="Camera Z:")
+        cam_z_label.grid(row=10, column=0, sticky="w", pady=(5, 2))
+        
+        self.camera_z_var = tk.DoubleVar(value=5.0)
+        cam_z_scale = ttk.Scale(gd3d_params_frame, from_=1, to=20, variable=self.camera_z_var, 
+                               orient="horizontal", length=150, command=self.on_camera_z_change)
+        cam_z_scale.grid(row=10, column=1, sticky="w", padx=(10, 0))
+        
+        cam_z_value_label = ttk.Label(gd3d_params_frame, textvariable=self.camera_z_var)
+        cam_z_value_label.grid(row=10, column=1, sticky="e", padx=(0, 10))
+        
+        # Animation Controls Section
+        anim_controls_label = ttk.Label(plot_controls_frame, text="Animation Controls:", style="Bold.TLabel")
+        anim_controls_label.grid(row=4, column=0, sticky="w", pady=(20, 5))
+        
+        # Create frame for animation controls
+        anim_controls_frame = ttk.Frame(plot_controls_frame)
+        anim_controls_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        anim_controls_frame.grid_columnconfigure(0, weight=1)
+        anim_controls_frame.grid_columnconfigure(1, weight=1)
+        
+        # Animation Speed Control (enhanced)
+        anim_speed_label = ttk.Label(anim_controls_frame, text="Animation Speed:")
+        anim_speed_label.grid(row=0, column=0, sticky="w", pady=(5, 2))
+        
+        self.anim_speed_var = tk.DoubleVar(value=1.0)
+        anim_speed_scale = ttk.Scale(anim_controls_frame, from_=0.1, to=5.0, variable=self.anim_speed_var, 
+                                    orient="horizontal", length=150, command=self.on_anim_speed_change)
+        anim_speed_scale.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        
+        anim_speed_value_label = ttk.Label(anim_controls_frame, textvariable=self.anim_speed_var)
+        anim_speed_value_label.grid(row=0, column=1, sticky="e", padx=(0, 10))
+        
+        # Frame Rate Control
+        frame_rate_label = ttk.Label(anim_controls_frame, text="Frame Rate (FPS):")
+        frame_rate_label.grid(row=1, column=0, sticky="w", pady=(10, 2))
+        
+        self.frame_rate_var = tk.DoubleVar(value=30.0)
+        frame_rate_scale = ttk.Scale(anim_controls_frame, from_=1, to=60, variable=self.frame_rate_var, 
+                                    orient="horizontal", length=150, command=self.on_frame_rate_change)
+        frame_rate_scale.grid(row=1, column=1, sticky="w", padx=(10, 0))
+        
+        frame_rate_value_label = ttk.Label(anim_controls_frame, textvariable=self.frame_rate_var)
+        frame_rate_value_label.grid(row=1, column=1, sticky="e", padx=(0, 10))
+        
+        # Loop Mode Control (replaced listbox with combobox)
+        loop_mode_label = ttk.Label(anim_controls_frame, text="Loop Mode:")
+        loop_mode_label.grid(row=2, column=0, sticky="w", pady=(10, 2))
+        
+        self.loop_mode_var = tk.StringVar(value="Loop")
+        loop_modes = ["Loop", "Once", "Ping-Pong"]
+        loop_mode_combo = ttk.Combobox(anim_controls_frame, textvariable=self.loop_mode_var, 
+                                      values=loop_modes, width=15, state="readonly")
+        loop_mode_combo.grid(row=2, column=1, sticky="w", padx=(10, 0))
+        loop_mode_combo.bind('<<ComboboxSelected>>', self.on_loop_mode_change)
+        
+        # Playback Direction Control (replaced listbox with combobox)
+        playback_dir_label = ttk.Label(anim_controls_frame, text="Playback Direction:")
+        playback_dir_label.grid(row=3, column=0, sticky="w", pady=(10, 2))
+        
+        self.playback_dir_var = tk.StringVar(value="Forward")
+        playback_dirs = ["Forward", "Reverse"]
+        playback_dir_combo = ttk.Combobox(anim_controls_frame, textvariable=self.playback_dir_var, 
+                                         values=playback_dirs, width=15, state="readonly")
+        playback_dir_combo.grid(row=3, column=1, sticky="w", padx=(10, 0))
+        playback_dir_combo.bind('<<ComboboxSelected>>', self.on_playback_dir_change)
+        
+        # Auto-play Control
+        autoplay_label = ttk.Label(anim_controls_frame, text="Auto-play:")
+        autoplay_label.grid(row=4, column=0, sticky="w", pady=(10, 2))
+        
+        self.autoplay_var = tk.BooleanVar(value=False)
+        autoplay_check = ttk.Checkbutton(anim_controls_frame, text="Enable", variable=self.autoplay_var, 
+                                        command=self.on_autoplay_change)
+        autoplay_check.grid(row=4, column=1, sticky="w", padx=(10, 0))
+        
+        # Animation Progress Control
+        anim_progress_label = ttk.Label(anim_controls_frame, text="Animation Progress:")
+        anim_progress_label.grid(row=5, column=0, sticky="w", pady=(10, 2))
+        
+        self.anim_progress_var = tk.DoubleVar(value=0.0)
+        anim_progress_scale = ttk.Scale(anim_controls_frame, from_=0, to=100, variable=self.anim_progress_var, 
+                                       orient="horizontal", length=150, command=self.on_anim_progress_change)
+        anim_progress_scale.grid(row=5, column=1, sticky="w", padx=(10, 0))
+        
+        anim_progress_value_label = ttk.Label(anim_controls_frame, textvariable=self.anim_progress_var)
+        anim_progress_value_label.grid(row=5, column=1, sticky="e", padx=(0, 10))
+        
+        # Animation Controls Buttons
+        anim_buttons_frame = ttk.Frame(anim_controls_frame)
+        anim_buttons_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(15, 0))
+        anim_buttons_frame.grid_columnconfigure(0, weight=1)
+        anim_buttons_frame.grid_columnconfigure(1, weight=1)
+        anim_buttons_frame.grid_columnconfigure(2, weight=1)
+        anim_buttons_frame.grid_columnconfigure(3, weight=1)
+        
+        play_btn = ttk.Button(anim_buttons_frame, text="Play", command=self.play_3d_animation)
+        play_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        
+        pause_btn = ttk.Button(anim_buttons_frame, text="Pause", command=self.pause_3d_animation)
+        pause_btn.grid(row=0, column=1, sticky="ew", padx=2)
+        
+        stop_btn = ttk.Button(anim_buttons_frame, text="Stop", command=self.stop_3d_animation)
+        stop_btn.grid(row=0, column=2, sticky="ew", padx=2)
+        
+        reset_btn = ttk.Button(anim_buttons_frame, text="Reset", command=self.reset_3d_animation)
+        reset_btn.grid(row=0, column=3, sticky="ew", padx=(5, 0))
         
         # Status bar
         status_frame = ttk.Frame(control_frame)
@@ -540,7 +1060,7 @@ class StockPredictionGUI:
         self.status_bar = ttk.Label(status_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         self.status_bar.grid(row=0, column=0, sticky="ew")
         
-        print("Control panel created with 3 tabs")
+        print("Control panel created with 4 tabs")
 
     def browse_data_file(self):
         """Browse for data file."""
@@ -621,32 +1141,173 @@ class StockPredictionGUI:
             return
         
         if not self.data_file:
-            messagebox.showerror("No Data File", "Please select a data file first.")
+            # Try to find a suitable data file automatically
+            auto_file = self.find_suitable_data_file()
+            if auto_file:
+                # Validate and convert the auto-selected file
+                validated_file = self.validate_and_convert_data_file(auto_file)
+                if validated_file:
+                    self.data_file = validated_file
+                    self.data_file_var.set(os.path.basename(validated_file))
+                    self.load_data_features()  # Load features for the auto-selected file
+                    messagebox.showinfo("Data File Auto-Selected", 
+                                      f"Automatically selected and validated data file: {os.path.basename(validated_file)}\n\n"
+                                      f"Training will proceed with this file.")
+                else:
+                    messagebox.showerror("Data File Error", 
+                                       "No suitable data file found. Please select a data file manually.")
+                    return
+            else:
+                messagebox.showerror("No Data File", 
+                                   "Please select a data file before starting training.\n\n"
+                                   "The file should have OHLCV columns (open, high, low, close, vol) "
+                                   "or generic feature columns (feature_1, feature_2, etc.).")
+                return
+        
+        # Validate the selected data file
+        validated_file = self.validate_and_convert_data_file(self.data_file)
+        if not validated_file:
+            messagebox.showerror("Data File Error", 
+                               "The selected data file is not valid for training.\n\n"
+                               "Please select a file with proper OHLCV format or "
+                               "generic feature columns that can be converted.")
             return
         
-        if not self.target_combo.get():
-            messagebox.showerror("No Target", "Please select a target feature.")
+        # Update the data file to the validated/converted version
+        if validated_file != self.data_file:
+            self.data_file = validated_file
+            self.data_file_var.set(os.path.basename(validated_file))
+            self.load_data_features()
+        
+        # Check if output directory is set
+        if not self.output_dir:
+            messagebox.showerror("No Output Directory", "Please select an output directory.")
             return
+        
+        # Clear all plots and reset plot state before starting new training
+        self.clear_all_plots()
+        
+        # Start training in a separate thread
+        self.is_training = True
+        self.training_thread = threading.Thread(target=self._train_model)
+        self.training_thread.daemon = True
+        self.training_thread.start()
+        
+        # Update UI
+        self.train_button.config(state='disabled')
+        self.status_var.set("Training in progress...")
+
+    def find_suitable_data_file(self):
+        """Find a suitable data file for training."""
+        # Check for sample data files first
+        sample_files = [
+            'sample_stock_data.csv',
+            'sample_stock_data_extended.csv',
+            'tsla_combined.csv'
+        ]
+        
+        for file in sample_files:
+            if os.path.exists(file):
+                return file
+        
+        # Check for any CSV files in current directory
+        csv_files = [f for f in os.listdir('.') if f.endswith('.csv')]
+        if csv_files:
+            return csv_files[0]
+        
+        return None
+
+    def validate_and_convert_data_file(self, file_path):
+        """
+        Validate a data file and convert it to OHLCV format if needed.
+        
+        Args:
+            file_path (str): Path to the data file
+            
+        Returns:
+            str: Path to the validated/converted file, or None if failed
+        """
+        if not os.path.exists(file_path):
+            return None
         
         try:
-            self.is_training = True
-            self.train_button.config(state=tk.DISABLED)
-            self.status_var.set("Starting training...")
+            # Read the file to check its format
+            df = pd.read_csv(file_path, nrows=5)  # Read first 5 rows for analysis
             
-            # Clear previous training log
-            self.clear_training_log()
-            self.append_training_log("=== Starting New Training Session ===\n")
+            if DATA_CONVERTER_AVAILABLE:
+                # Use the data converter to detect format
+                format_info = detect_data_format(df)
+                
+                if format_info['status'] == 'ready':
+                    # File is already in OHLCV format
+                    return file_path
+                
+                elif format_info['status'] == 'convertible':
+                    # File can be converted
+                    response = messagebox.askyesno(
+                        "Data Conversion Required",
+                        f"Data file '{os.path.basename(file_path)}' needs to be converted to OHLCV format.\n\n"
+                        f"Detected format: {format_info['format']}\n"
+                        f"Message: {format_info['message']}\n\n"
+                        "Would you like to convert it automatically?"
+                    )
+                    
+                    if response:
+                        # Convert the file
+                        converted_file = convert_data_file(file_path)
+                        if converted_file:
+                            messagebox.showinfo(
+                                "Conversion Successful",
+                                f"Data file converted successfully!\n\n"
+                                f"Original: {os.path.basename(file_path)}\n"
+                                f"Converted: {os.path.basename(converted_file)}\n\n"
+                                f"The converted file will be used for training."
+                            )
+                            return converted_file
+                        else:
+                            messagebox.showerror(
+                                "Conversion Failed",
+                                "Failed to convert the data file. Please check the file format."
+                            )
+                            return None
+                    else:
+                        # User chose not to convert
+                        return None
+                
+                else:
+                    # File is incompatible
+                    messagebox.showerror(
+                        "Incompatible Data Format",
+                        f"Data file '{os.path.basename(file_path)}' has an incompatible format.\n\n"
+                        f"Error: {format_info['message']}\n\n"
+                        "Please use a file with OHLCV columns (open, high, low, close, vol) or "
+                        "generic feature columns (feature_1, feature_2, etc.)."
+                    )
+                    return None
             
-            # Start training in a separate thread
-            self.training_thread = threading.Thread(target=self._train_model)
-            self.training_thread.daemon = True
-            self.training_thread.start()
-            
+            else:
+                # Data converter not available - do basic validation
+                columns = list(df.columns)
+                ohlcv_columns = ['open', 'high', 'low', 'close', 'vol']
+                
+                if all(col in columns for col in ohlcv_columns):
+                    return file_path
+                else:
+                    messagebox.showerror(
+                        "Invalid Data Format",
+                        f"Data file '{os.path.basename(file_path)}' does not have the required OHLCV columns.\n\n"
+                        f"Required columns: {ohlcv_columns}\n"
+                        f"Found columns: {columns}\n\n"
+                        "Please use a file with proper OHLCV format or install the data converter."
+                    )
+                    return None
+                    
         except Exception as e:
-            print(f"Error starting training: {e}")
-            self.is_training = False
-            self.train_button.config(state=tk.NORMAL)
-            self.status_var.set(f"Error starting training: {str(e)}")
+            messagebox.showerror(
+                "File Read Error",
+                f"Error reading data file '{os.path.basename(file_path)}':\n\n{str(e)}"
+            )
+            return None
 
     def append_training_log(self, line):
         """Safely append a line to the training log text widget."""
@@ -667,12 +1328,290 @@ class StockPredictionGUI:
         except Exception as e:
             print(f"Error clearing training log: {e}")
 
+    def clear_all_plots(self):
+        """Clear all plots and reset plot state before starting new training."""
+        try:
+            print("🧹 Clearing all plots and resetting plot state...")
+            
+            # 1. Close any existing live plot
+            if hasattr(self, 'live_plot_window_open') and self.live_plot_window_open:
+                self.close_live_plot()
+            
+            # 2. Clear training results plot
+            if hasattr(self, 'results_ax') and self.results_ax is not None:
+                self.results_ax.clear()
+                self.results_ax.set_title("Training Results")
+                self.results_ax.set_xlabel("Epoch")
+                self.results_ax.set_ylabel("Loss")
+                self.results_ax.grid(True)
+                try:
+                    self.results_canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error updating results canvas: {e}")
+            
+            # 3. Clear plots tab
+            if hasattr(self, 'plots_ax') and self.plots_ax is not None:
+                self.plots_ax.clear()
+                self.plots_ax.set_title("Training Plots")
+                self.plots_ax.set_xlabel("Epoch")
+                self.plots_ax.set_ylabel("Loss")
+                self.plots_ax.grid(True)
+                try:
+                    self.plots_canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error updating plots canvas: {e}")
+            
+            # 4. Clear 3D gradient descent plot
+            if hasattr(self, 'gd3d_ax') and self.gd3d_ax is not None:
+                self.gd3d_ax.clear()
+                self.gd3d_ax.set_title("3D Gradient Descent")
+                self.gd3d_ax.set_xlabel("Weight 1")
+                self.gd3d_ax.set_ylabel("Weight 2")
+                self.gd3d_ax.set_zlabel("Loss")
+                try:
+                    self.gd3d_canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error updating 3D canvas: {e}")
+            
+            # 5. Clear prediction plots
+            if hasattr(self, 'pred_ax') and self.pred_ax is not None:
+                self.pred_ax.clear()
+                self.pred_ax.set_title("Prediction Results")
+                self.pred_ax.set_xlabel(self.get_ticker_from_filename())
+                self.pred_ax.set_ylabel("Value")
+                self.pred_ax.grid(True)
+                try:
+                    self.pred_canvas.draw_idle()
+                except Exception as e:
+                    print(f"Error updating prediction canvas: {e}")
+            
+            # 6. Clear saved plots
+            if hasattr(self, 'saved_plots_inner_frame'):
+                for widget in self.saved_plots_inner_frame.winfo_children():
+                    widget.destroy()
+                if hasattr(self, 'saved_plots_images'):
+                    self.saved_plots_images.clear()
+            
+            # 7. Clear training log
+            self.clear_training_log()
+            
+            # 8. Reset selected model
+            self.selected_model_path = None
+            
+            # 9. Update status
+            self.status_var.set("All plots cleared and reset")
+            print("✅ All plots cleared and reset successfully")
+            
+        except Exception as e:
+            print(f"Error clearing plots: {e}")
+            self.status_var.set(f"Error clearing plots: {str(e)}")
+
+    def clear_cache_only(self):
+        """Clear all caches without reinitializing plots."""
+        try:
+            print("🧹 Clearing all caches...")
+            
+            # 1. Clear image caches
+            if hasattr(self, 'image_cache'):
+                self.image_cache.clear()
+                print("✅ Image cache cleared")
+            
+            if hasattr(self, 'plot_image_cache'):
+                self.plot_image_cache.clear()
+                print("✅ Plot image cache cleared")
+            
+            # 2. Clear saved plots images
+            if hasattr(self, 'saved_plots_images'):
+                self.saved_plots_images.clear()
+                print("✅ Saved plots images cleared")
+            
+            # 3. Clear any pending plot futures
+            if hasattr(self, 'plot_futures'):
+                for future in self.plot_futures.values():
+                    if not future.done():
+                        future.cancel()
+                self.plot_futures.clear()
+                print("✅ Plot futures cleared")
+            
+            # 4. Update status
+            self.status_var.set("Cache cleared successfully")
+            print("✅ Cache cleared successfully")
+            
+        except Exception as e:
+            print(f"Error clearing cache: {e}")
+            self.status_var.set(f"Error clearing cache: {str(e)}")
+
+    def clear_cache_and_reinitialize(self):
+        """Clear all caches and reinitialize all plots."""
+        try:
+            print("🧹 Clearing all caches and reinitializing plots...")
+            
+            # 1. Clear image caches
+            if hasattr(self, 'image_cache'):
+                self.image_cache.clear()
+                print("✅ Image cache cleared")
+            
+            if hasattr(self, 'plot_image_cache'):
+                self.plot_image_cache.clear()
+                print("✅ Plot image cache cleared")
+            
+            # 2. Clear saved plots images
+            if hasattr(self, 'saved_plots_images'):
+                self.saved_plots_images.clear()
+                print("✅ Saved plots images cleared")
+            
+            # 3. Clear any pending plot futures
+            if hasattr(self, 'plot_futures'):
+                for future in self.plot_futures.values():
+                    if not future.done():
+                        future.cancel()
+                self.plot_futures.clear()
+                print("✅ Plot futures cleared")
+            
+            # 4. Clear all plots
+            self.clear_all_plots()
+            
+            # 5. Reinitialize all plot canvases
+            self._reinitialize_plot_canvases()
+            
+            # 6. Refresh models to reload data
+            self.refresh_models()
+            
+            # 7. Update status
+            self.status_var.set("Cache cleared and plots reinitialized")
+            print("✅ Cache cleared and plots reinitialized successfully")
+            
+        except Exception as e:
+            print(f"Error clearing cache and reinitializing: {e}")
+            self.status_var.set(f"Error clearing cache: {str(e)}")
+
+    def _reinitialize_plot_canvases(self):
+        """Reinitialize all plot canvases with fresh matplotlib figures."""
+        try:
+            print("🔄 Reinitializing plot canvases...")
+            
+            # 1. Reinitialize training results canvas
+            if hasattr(self, 'train_results_frame'):
+                # Clear existing canvas
+                for widget in self.train_results_frame.winfo_children():
+                    if hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            if isinstance(child, FigureCanvasTkAgg):
+                                child.get_tk_widget().destroy()
+                
+                # Create new figure and canvas
+                fig, ax = plt.subplots(figsize=(8, 6))
+                self.results_ax = ax
+                self.results_canvas = FigureCanvasTkAgg(fig, self.train_results_frame)
+                self.results_canvas.draw()
+                self.results_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                
+                # Add toolbar
+                toolbar = GridMatplotlibToolbar(self.results_canvas, self.train_results_frame)
+                toolbar.grid(row=2, column=0, sticky="ew")
+                
+                # Set initial plot
+                ax.set_title("Training Results")
+                ax.set_xlabel("Epoch")
+                ax.set_ylabel("Loss")
+                ax.grid(True)
+                ax.text(0.5, 0.5, 'Training in progress...', ha='center', va='center', 
+                       transform=ax.transAxes, fontsize=12)
+            
+            # 2. Reinitialize plots tab canvas
+            if hasattr(self, 'plots_frame'):
+                # Clear existing canvas
+                for widget in self.plots_frame.winfo_children():
+                    if hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            if isinstance(child, FigureCanvasTkAgg):
+                                child.get_tk_widget().destroy()
+                
+                # Create new figure and canvas
+                fig, ax = plt.subplots(figsize=(8, 6))
+                self.plots_ax = ax
+                self.plots_canvas = FigureCanvasTkAgg(fig, self.plots_frame)
+                self.plots_canvas.draw()
+                self.plots_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                
+                # Add toolbar
+                toolbar = GridMatplotlibToolbar(self.plots_canvas, self.plots_frame)
+                toolbar.grid(row=2, column=0, sticky="ew")
+                
+                # Set initial plot
+                ax.set_title("Training Plots")
+                ax.set_xlabel("Epoch")
+                ax.set_ylabel("Loss")
+                ax.grid(True)
+                ax.text(0.5, 0.5, 'Training in progress...', ha='center', va='center', 
+                       transform=ax.transAxes, fontsize=12)
+            
+            # 3. Reinitialize 3D gradient descent canvas
+            if hasattr(self, 'gd3d_frame'):
+                # Clear existing canvas
+                for widget in self.gd3d_frame.winfo_children():
+                    if hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            if isinstance(child, FigureCanvasTkAgg):
+                                child.get_tk_widget().destroy()
+                
+                # Create new figure and canvas
+                fig = plt.figure(figsize=(8, 6))
+                ax = fig.add_subplot(111, projection='3d')
+                self.gd3d_ax = ax
+                self.gd3d_canvas = FigureCanvasTkAgg(fig, self.gd3d_frame)
+                self.gd3d_canvas.draw()
+                self.gd3d_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                
+                # Add toolbar
+                toolbar = GridMatplotlibToolbar(self.gd3d_canvas, self.gd3d_frame)
+                toolbar.grid(row=2, column=0, sticky="ew")
+                
+                # Set initial plot
+                ax.set_title("3D Gradient Descent")
+                ax.set_xlabel("Weight 1")
+                ax.set_ylabel("Weight 2")
+                ax.set_zlabel("Loss")
+                ax.text2D(0.5, 0.5, 'Training in progress...', ha='center', va='center', 
+                         transform=ax.transAxes, fontsize=12)
+            
+            # 4. Reinitialize prediction canvas
+            if hasattr(self, 'pred_results_frame'):
+                # Clear existing canvas
+                for widget in self.pred_results_frame.winfo_children():
+                    if hasattr(widget, 'winfo_children'):
+                        for child in widget.winfo_children():
+                            if isinstance(child, FigureCanvasTkAgg):
+                                child.get_tk_widget().destroy()
+                
+                # Create new figure and canvas
+                fig, ax = plt.subplots(figsize=(8, 6))
+                self.pred_ax = ax
+                self.pred_canvas = FigureCanvasTkAgg(fig, self.pred_results_frame)
+                self.pred_canvas.draw()
+                self.pred_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                
+                # Add toolbar
+                toolbar = GridMatplotlibToolbar(self.pred_canvas, self.pred_results_frame)
+                toolbar.grid(row=2, column=0, sticky="ew")
+                
+                # Set initial plot
+                ax.set_title("Prediction Results")
+                ax.set_xlabel(self.get_ticker_from_filename())
+                ax.set_ylabel("Value")
+                ax.grid(True)
+                ax.text(0.5, 0.5, 'Select a model and data file to view predictions', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            
+            print("✅ All plot canvases reinitialized successfully")
+            
+        except Exception as e:
+            print(f"Error reinitializing plot canvases: {e}")
+            self.status_var.set(f"Error reinitializing plots: {str(e)}")
+
     def _train_model(self):
         """Train the model (runs in separate thread)."""
         try:
-            # Clear the training log
-            self.root.after(0, self.clear_training_log)
-            
             # Get training parameters
             hidden_size = int(self.hidden_size_var.get())
             learning_rate = float(self.learning_rate_var.get())
@@ -690,6 +1629,10 @@ class StockPredictionGUI:
             
             y_feature = self.target_combo.get()
             
+            # Validate data file exists and has required columns
+            if not os.path.exists(self.data_file):
+                raise Exception(f"Data file not found: {self.data_file}")
+            
             # Build command
             cmd = [
                 sys.executable, 'stock_net.py',
@@ -703,6 +1646,10 @@ class StockPredictionGUI:
             
             # Start training process with live output
             self.root.after(0, lambda: self.append_training_log(f"Starting training with command: {' '.join(cmd)}\n"))
+            self.root.after(0, lambda: self.append_training_log(f"Data file: {self.data_file}\n"))
+            self.root.after(0, lambda: self.append_training_log(f"Features: {x_features}\n"))
+            self.root.after(0, lambda: self.append_training_log(f"Target: {y_feature}\n"))
+            self.root.after(0, lambda: self.append_training_log("-" * 50 + "\n"))
             
             process = subprocess.Popen(
                 cmd, 
@@ -731,6 +1678,16 @@ class StockPredictionGUI:
             if return_code != 0:
                 error_msg = f"Training failed with return code {return_code}"
                 self.root.after(0, lambda: self.append_training_log(f"\n{error_msg}\n"))
+                
+                # Provide more specific error information
+                if return_code == 1:
+                    error_msg += "\n\nCommon causes:\n"
+                    error_msg += "1. Data file missing required columns (open, high, low, close, vol)\n"
+                    error_msg += "2. Data file is empty or corrupted\n"
+                    error_msg += "3. Invalid feature names specified\n"
+                    error_msg += "4. Insufficient data for training\n\n"
+                    error_msg += "Please check your data file and try again."
+                
                 raise Exception(error_msg)
             
             # Training completed successfully
@@ -781,20 +1738,44 @@ class StockPredictionGUI:
         try:
             self.status_var.set("Making prediction...")
             
-            # Run prediction using predict.py
+            # Load feature info from the model
+            feature_info_path = os.path.join(self.selected_model_path, 'feature_info.json')
+            if not os.path.exists(feature_info_path):
+                messagebox.showerror("Model Error", "No feature_info.json found in model directory.")
+                return
+            
+            with open(feature_info_path, 'r') as f:
+                feature_info = json.load(f)
+            
+            # Run prediction using predict.py with correct feature parameters
             cmd = [
                 sys.executable, 'predict.py',
                 self.data_file,  # Input file as positional argument
                 '--model_dir', self.selected_model_path,
-                '--output_dir', self.output_dir
+                '--output_dir', self.selected_model_path,  # Save in model directory
+                '--x_features', ','.join(feature_info['x_features']),  # Add feature parameters
+                '--y_feature', feature_info['y_feature']  # Add target feature
             ]
             
+            print(f"Running prediction command: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            print(f"Prediction return code: {result.returncode}")
+            print(f"Prediction stdout: {result.stdout}")
+            print(f"Prediction stderr: {result.stderr}")
+            
             if result.returncode != 0:
-                raise Exception(f"Prediction failed: {result.stderr}")
+                error_msg = result.stderr if result.stderr else "Unknown error occurred"
+                raise Exception(f"Prediction failed: {error_msg}")
             
             self.status_var.set("Prediction completed successfully!")
             messagebox.showinfo("Success", "Prediction completed successfully!")
+            
+            # Automatically update the Prediction Results tab
+            self.update_prediction_results()
+            
+            # Refresh prediction files list
+            self.refresh_prediction_files()
             
         except Exception as e:
             print(f"Error making prediction: {e}")
@@ -828,6 +1809,18 @@ class StockPredictionGUI:
             point_size = int(self.point_size_var.get())
             line_width = int(self.line_width_var.get())
             surface_alpha = float(self.surface_alpha_var.get())
+            w1_range_min = float(self.w1_range_min_var.get())
+            w1_range_max = float(self.w1_range_max_var.get())
+            w2_range_min = float(self.w2_range_min_var.get())
+            w2_range_max = float(self.w2_range_max_var.get())
+            n_points = int(self.n_points_var.get())
+            view_elev = float(self.view_elev_var.get())
+            view_azim = float(self.view_azim_var.get())
+            fps = int(self.fps_var.get())
+            w1_index = int(self.w1_index_var.get())
+            w2_index = int(self.w2_index_var.get())
+            output_width = int(self.output_width_var.get())
+            output_height = int(self.output_height_var.get())
             
             # Run 3D visualization using gradient_descent_3d.py
             cmd = [
@@ -837,6 +1830,15 @@ class StockPredictionGUI:
                 '--point_size', str(point_size),
                 '--line_width', str(line_width),
                 '--surface_alpha', str(surface_alpha),
+                '--w1_range', str(w1_range_min), str(w1_range_max),
+                '--w2_range', str(w2_range_min), str(w2_range_max),
+                '--n_points', str(n_points),
+                '--view_elev', str(view_elev),
+                '--view_azim', str(view_azim),
+                '--fps', str(fps),
+                '--w1_index', str(w1_index),
+                '--w2_index', str(w2_index),
+                '--output_resolution', str(output_width), str(output_height),
                 '--save_png'
             ]
             
@@ -895,6 +1897,10 @@ class StockPredictionGUI:
             if os.path.exists(loss_file):
                 losses = np.loadtxt(loss_file, delimiter=',')
                 print(f"Training losses loaded: {len(losses)} epochs")
+            
+            # Load normalization parameters
+            self.X_min = np.loadtxt(os.path.join(self.selected_model_path, 'scaler_mean.csv'), delimiter=',')
+            self.X_max = np.loadtxt(os.path.join(self.selected_model_path, 'scaler_std.csv'), delimiter=',') + self.X_min
             
         except Exception as e:
             print(f"Error loading model info: {e}")
@@ -1055,8 +2061,11 @@ class StockPredictionGUI:
                 # Add legend
                 self.gd3d_ax.legend()
                 
-                # Refresh the canvas
-                self.gd3d_canvas.draw()
+                # Safe canvas update
+                try:
+                    self.gd3d_canvas.draw_idle()
+                except Exception as canvas_error:
+                    print(f"Canvas update error in 3D gradient descent creation: {canvas_error}")
                 
                 print(f"Created 3D gradient descent visualization with {len(weights)} weight points")
             else:
@@ -1066,6 +2075,59 @@ class StockPredictionGUI:
             print(f"Error creating 3D gradient descent visualization: {e}")
             import traceback
             traceback.print_exc()
+
+    def initialize_prediction_canvas(self):
+        """Initialize the prediction canvas and axes if they don't exist."""
+        try:
+            # Find the prediction results frame in the display panel
+            for widget in self.root.winfo_children():
+                if hasattr(widget, 'winfo_children'):
+                    for child in widget.winfo_children():
+                        if hasattr(child, 'winfo_children'):
+                            for grandchild in child.winfo_children():
+                                if isinstance(grandchild, ttk.Notebook):
+                                    # This is the display notebook
+                                    for tab_id in range(grandchild.index('end')):
+                                        tab_text = grandchild.tab(tab_id, 'text')
+                                        if 'prediction' in tab_text.lower():
+                                            # Found prediction results tab
+                                            for tab_child in grandchild.winfo_children():
+                                                if hasattr(tab_child, 'winfo_children'):
+                                                    for frame in tab_child.winfo_children():
+                                                        if isinstance(frame, ttk.Frame):
+                                                            # Create figure and canvas
+                                                            fig, ax = plt.subplots(figsize=(10, 6))
+                                                            self.pred_ax = ax
+                                                            self.pred_canvas = FigureCanvasTkAgg(fig, frame)
+                                                            self.pred_canvas.draw()
+                                                            self.pred_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                                                            
+                                                            # Add toolbar
+                                                            toolbar = GridMatplotlibToolbar(self.pred_canvas, frame)
+                                                            toolbar.grid(row=2, column=0, sticky="ew")
+                                                            
+                                                            # Show placeholder
+                                                            ax.text(0.5, 0.5, 'Select a model and data file to view predictions', 
+                                                                   ha='center', va='center', transform=ax.transAxes,
+                                                                   fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+                                                            ax.set_title("Prediction Results")
+                                                            ax.axis('off')
+                                                            
+                                                            # Safe canvas update
+                                                            try:
+                                                                self.pred_canvas.draw_idle()
+                                                            except Exception as canvas_error:
+                                                                print(f"Canvas update error: {canvas_error}")
+                                                            
+                                                            return True
+                                            break
+                                    break
+                        break
+                break
+            return False
+        except Exception as e:
+            print(f"Error initializing prediction canvas: {e}")
+            return False
 
     def create_display_panel(self):
         """Create the right display panel for plots and results (now using grid)"""
@@ -1119,7 +2181,12 @@ class StockPredictionGUI:
                             ha='center', va='center', transform=self.results_ax.transAxes,
                             fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
         self.results_ax.set_title("Training Results")
-        self.results_canvas.draw()
+        
+        # Safe canvas update
+        try:
+            self.results_canvas.draw_idle()
+        except Exception as canvas_error:
+            print(f"Canvas update error in training results initialization: {canvas_error}")
         
         print("Training Results tab created successfully")
 
@@ -1127,14 +2194,50 @@ class StockPredictionGUI:
         pred_results_frame = ttk.Frame(self.display_notebook)
         self.display_notebook.add(pred_results_frame, text="Prediction Results")
         pred_results_frame.grid_columnconfigure(0, weight=1)
-        pred_results_frame.grid_rowconfigure(0, weight=1)
+        pred_results_frame.grid_rowconfigure(0, weight=0)  # Controls
+        pred_results_frame.grid_rowconfigure(1, weight=1)  # Plot canvas
+        pred_results_frame.grid_rowconfigure(2, weight=0)  # Toolbar
+        
+        # Add controls frame for prediction results
+        pred_controls_frame = ttk.Frame(pred_results_frame)
+        pred_controls_frame.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+        pred_controls_frame.grid_columnconfigure(0, weight=1)
+        
+        # Add refresh button for prediction results
+        self.refresh_pred_btn = ttk.Button(pred_controls_frame, text="🔄 Refresh Prediction Results", 
+                                          command=self.update_prediction_results)
+        self.refresh_pred_btn.grid(row=0, column=0, padx=5, pady=5)
+        
+        # Add status label for prediction results
+        self.pred_status_label = ttk.Label(pred_controls_frame, text="Select a model to view prediction results", 
+                                          foreground=TEXT_COLOR, background=FRAME_COLOR)
+        self.pred_status_label.grid(row=1, column=0, padx=5, pady=5)
         
         # Create figure for prediction plot
         self.pred_fig = plt.Figure(figsize=(5, 4), dpi=100)
         self.pred_ax = self.pred_fig.add_subplot(111)
         self.pred_canvas = FigureCanvasTkAgg(self.pred_fig, master=pred_results_frame)
-        self.pred_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.pred_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
         
+        # Add toolbar for prediction results
+        pred_toolbar = GridMatplotlibToolbar(self.pred_canvas, pred_results_frame)
+        pred_toolbar.grid(row=2, column=0, sticky="ew")
+        
+        # Initialize with a placeholder plot
+        self.pred_ax.text(0.5, 0.5, 'Select a model and data file to view predictions', 
+                         ha='center', va='center', transform=self.pred_ax.transAxes,
+                         fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+        self.pred_ax.set_title("Prediction Results")
+        self.pred_ax.axis('off')
+        
+        # Safe canvas update
+        try:
+            self.pred_canvas.draw_idle()
+        except Exception as canvas_error:
+            print(f"Canvas update error in prediction results initialization: {canvas_error}")
+        
+        print("Prediction Results tab created successfully")
+
         # Gradient Descent Tab
         gd_frame = ttk.Frame(self.display_notebook)
         self.display_notebook.add(gd_frame, text="Live Training")
@@ -1157,7 +2260,12 @@ class StockPredictionGUI:
                        ha='center', va='center', transform=self.gd_ax.transAxes,
                        fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
         self.gd_ax.set_title("Live Training Progress")
-        self.gd_canvas.draw()
+        
+        # Safe canvas update
+        try:
+            self.gd_canvas.draw_idle()
+        except Exception as canvas_error:
+            print(f"Canvas update error in gradient descent initialization: {canvas_error}")
         
         print("Gradient Descent tab created successfully")
 
@@ -1183,7 +2291,12 @@ class StockPredictionGUI:
                           ha='center', va='center', transform=self.plots_ax.transAxes,
                           fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
         self.plots_ax.set_title("Model Plots")
-        self.plots_canvas.draw()
+        
+        # Safe canvas update
+        try:
+            self.plots_canvas.draw_idle()
+        except Exception as canvas_error:
+            print(f"Canvas update error in plots initialization: {canvas_error}")
         
         # 3D Gradient Descent Tab
         gd3d_frame = ttk.Frame(self.display_notebook)
@@ -1207,7 +2320,12 @@ class StockPredictionGUI:
                           ha='center', va='center', transform=self.gd3d_ax.transAxes,
                           fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue"))
         self.gd3d_ax.set_title("3D Gradient Descent Visualization")
-        self.gd3d_canvas.draw()
+        
+        # Safe canvas update
+        try:
+            self.gd3d_canvas.draw_idle()
+        except Exception as canvas_error:
+            print(f"Canvas update error in 3D gradient descent initialization: {canvas_error}")
         
         print("3D Gradient Descent tab created successfully")
         
@@ -1254,12 +2372,12 @@ class StockPredictionGUI:
         live_controls_frame.grid_columnconfigure(0, weight=1)
         
         # Add button to open live plot
-        self.open_live_plot_btn = ttk.Button(live_controls_frame, text="Open Live Training Plot", 
+        self.open_live_plot_btn = ttk.Button(live_controls_frame, text="Open Live Training Plot (Matplotlib)", 
                                             command=self.open_live_training_plot)
         self.open_live_plot_btn.grid(row=0, column=0, padx=5, pady=5)
         
         # Add status label for live plot
-        self.live_plot_status = ttk.Label(live_controls_frame, text="Click 'Open Live Training Plot' to start monitoring", 
+        self.live_plot_status = ttk.Label(live_controls_frame, text="Click 'Open Live Training Plot (Matplotlib)' to start monitoring", 
                                          foreground=TEXT_COLOR, background=FRAME_COLOR)
         self.live_plot_status.grid(row=1, column=0, padx=5, pady=5)
         
@@ -1272,50 +2390,497 @@ class StockPredictionGUI:
         print("Live Training Plot tab created successfully")
         
         print(f"Display panel created with {self.display_notebook.index('end')} tabs")
+        
+        # Ensure prediction canvas is properly initialized
+        if not hasattr(self, 'pred_canvas') or not self.pred_canvas:
+            print("Initializing prediction canvas...")
+            self.initialize_prediction_canvas()
 
     def on_model_select(self, event):
-        """Handle model selection from combobox"""
+        """Handle model selection."""
         try:
-            model_name = self.model_combo.get()
-            if model_name:
-                # Find the actual model directory using path utilities
-                model_dir = path_utils.find_model_directory(model_name)
-                if model_dir:
+            selected_model = self.model_combo.get()
+            if selected_model:
+                # Find the model directory
+                model_dir = None
+                for item in os.listdir(self.current_model_dir):
+                    if item.startswith("model_") and os.path.isdir(os.path.join(self.current_model_dir, item)):
+                        if item == selected_model:
+                            model_dir = os.path.join(self.current_model_dir, item)
+                            break
+                
+                if model_dir and os.path.exists(model_dir):
                     self.selected_model_path = model_dir
-                else:
-                    # Fallback to current directory
-                    self.selected_model_path = os.path.join(self.current_model_dir, model_name)
-                
-                # Load model info and plots
-                self._load_model_info()
-                self.load_saved_plots()
-                
-                # Display training plots
-                self.display_training_plots()
-                
-                # Check for 3D visualization
-                if self.has_3d_visualization():
+                    print(f"Selected model: {selected_model} at {model_dir}")
+                    
+                    # Update prediction results automatically
+                    self.update_prediction_results()
+                    
+                    # Update training results
+                    self.display_training_plots()
+                    
+                    # Update 3D gradient descent tab
                     self.update_3d_gradient_descent_tab()
-                
-                # Try to create 3D gradient descent visualization if weight history files exist
-                try:
-                    weights_files = glob.glob(os.path.join(self.selected_model_path, 'weights_history_*.csv'))
-                    loss_file = os.path.join(self.selected_model_path, 'training_losses.csv')
-                    if weights_files and os.path.exists(loss_file):
-                        self.create_3d_gradient_descent_visualization(self.selected_model_path)
-                        print(f"Created 3D gradient descent visualization for {model_name}")
-                except Exception as e:
-                    print(f"Could not create 3D visualization for {model_name}: {e}")
-                
-                self.status_var.set(f"Selected model: {model_name}")
-                print(f"Selected model: {model_name} at {self.selected_model_path}")
-            else:
-                self.selected_model_path = None
-                self.status_var.set("No model selected")
+                    
+                    # Update saved plots tab
+                    self.load_saved_plots()
+                    
+                    # Refresh prediction files for this model
+                    self.refresh_prediction_files()
+                    
+                    self.status_var.set(f"Selected model: {selected_model}")
+                else:
+                    self.status_var.set(f"Model directory not found: {selected_model}")
         except Exception as e:
             print(f"Error in model selection: {e}")
-        
-    def refresh_models(self):
+            self.status_var.set(f"Error selecting model: {str(e)}")
+
+    def on_prediction_file_select(self, event):
+        """Handle prediction file selection."""
+        try:
+            selection = self.prediction_files_listbox.curselection()
+            if selection:
+                selected_file = self.prediction_files_listbox.get(selection[0])
+                self.selected_prediction_file = selected_file
+                print(f"Selected prediction file: {selected_file}")
+                self.status_var.set(f"Selected prediction file: {os.path.basename(selected_file)}")
+        except Exception as e:
+            print(f"Error in prediction file selection: {e}")
+            self.status_var.set(f"Error selecting prediction file: {str(e)}")
+
+    def refresh_prediction_files(self):
+        """Refresh the list of prediction files for the selected model."""
+        try:
+            self.prediction_files_listbox.delete(0, tk.END)
+            
+            if not self.selected_model_path:
+                self.status_var.set("No model selected")
+                return
+            
+            # Look for prediction files in the model directory
+            prediction_files = []
+            model_dir = self.selected_model_path
+            
+            # Check for common prediction file patterns
+            for file in os.listdir(model_dir):
+                if file.endswith('.csv') and any(pattern in file.lower() for pattern in ['prediction', 'pred', 'result', 'output']):
+                    prediction_files.append(file)
+            
+            # Also check for prediction files in subdirectories
+            for subdir in ['predictions', 'results', 'output']:
+                subdir_path = os.path.join(model_dir, subdir)
+                if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
+                    for file in os.listdir(subdir_path):
+                        if file.endswith('.csv'):
+                            prediction_files.append(os.path.join(subdir, file))
+            
+            # Sort files by modification time (newest first)
+            prediction_files.sort(key=lambda x: os.path.getmtime(os.path.join(model_dir, x)), reverse=True)
+            
+            # Add files to listbox
+            for file in prediction_files:
+                self.prediction_files_listbox.insert(tk.END, file)
+            
+            if prediction_files:
+                self.status_var.set(f"Found {len(prediction_files)} prediction file(s)")
+            else:
+                # Add helpful message to listbox when no files found
+                self.prediction_files_listbox.insert(tk.END, "No prediction files found")
+                self.prediction_files_listbox.insert(tk.END, "Use 'Make Prediction' button to create predictions")
+                self.prediction_files_listbox.insert(tk.END, "or run predict.py manually")
+                self.status_var.set("No prediction files found - use 'Make Prediction' to create them")
+                
+        except Exception as e:
+            print(f"Error refreshing prediction files: {e}")
+            self.status_var.set(f"Error refreshing prediction files: {str(e)}")
+
+    def view_prediction_results(self):
+        """View the selected prediction file results."""
+        try:
+            selection = self.prediction_files_listbox.curselection()
+            if not selection:
+                self.status_var.set("No prediction file selected")
+                return
+            
+            selected_file = self.prediction_files_listbox.get(selection[0])
+            
+            if not self.selected_model_path:
+                self.status_var.set("No model selected")
+                return
+            
+            # Construct full path to prediction file
+            if os.path.dirname(selected_file):
+                # File is in a subdirectory
+                pred_file_path = os.path.join(self.selected_model_path, selected_file)
+            else:
+                # File is directly in model directory
+                pred_file_path = os.path.join(self.selected_model_path, selected_file)
+            
+            if not os.path.exists(pred_file_path):
+                self.status_var.set(f"Prediction file not found: {selected_file}")
+                return
+            
+            # Load and display prediction results
+            self.load_prediction_file(pred_file_path)
+            
+            # Switch to Prediction Results tab
+            self.switch_to_tab(1)  # Prediction Results tab
+            
+            self.status_var.set(f"Loaded prediction results: {os.path.basename(selected_file)}")
+            
+        except Exception as e:
+            print(f"Error viewing prediction results: {e}")
+            self.status_var.set(f"Error viewing prediction results: {str(e)}")
+
+    def load_prediction_file(self, file_path):
+        """Load prediction file and update the Prediction Results tab."""
+        try:
+            import pandas as pd
+            
+            # Load the prediction file
+            df = pd.read_csv(file_path)
+            
+            # Update prediction results display
+            self.update_prediction_results_with_data(df, file_path)
+            
+        except Exception as e:
+            print(f"Error loading prediction file: {e}")
+            self.status_var.set(f"Error loading prediction file: {str(e)}")
+
+    def update_prediction_results_with_data(self, df, file_path):
+        """Update the Prediction Results tab with loaded prediction data."""
+        try:
+            # Clear the existing plot instead of destroying the canvas
+            if hasattr(self, 'pred_ax') and self.pred_ax:
+                self.pred_ax.clear()
+            else:
+                # If no existing axes, create a new figure
+                fig, ax = plt.subplots(figsize=(10, 6))
+                self.pred_ax = ax
+                # Create canvas if it doesn't exist
+                if not hasattr(self, 'pred_canvas') or not self.pred_canvas:
+                    # Find the prediction results frame
+                    for widget in self.root.winfo_children():
+                        if hasattr(widget, 'winfo_children'):
+                            for child in widget.winfo_children():
+                                if hasattr(child, 'winfo_children'):
+                                    for grandchild in child.winfo_children():
+                                        if isinstance(grandchild, ttk.Notebook):
+                                            # This is the display notebook
+                                            for tab_id in range(grandchild.index('end')):
+                                                tab = grandchild.select()
+                                                if 'prediction' in grandchild.tab(tab_id, 'text').lower():
+                                                    # Found prediction results tab
+                                                    for tab_child in grandchild.winfo_children():
+                                                        if hasattr(tab_child, 'winfo_children'):
+                                                            for frame in tab_child.winfo_children():
+                                                                if isinstance(frame, ttk.Frame):
+                                                                    self.pred_canvas = FigureCanvasTkAgg(fig, frame)
+                                                                    self.pred_canvas.draw()
+                                                                    self.pred_canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+                                                                    break
+                                                    break
+                                            break
+                                    break
+                        break
+                return
+            
+            # Get ticker name for x-axis label
+            ticker = self.get_ticker_from_filename()
+            
+            # Plot prediction results based on data structure
+            if 'actual' in df.columns and 'predicted' in df.columns:
+                # Create single combined plot with both actual and predicted
+                x_axis = range(len(df))
+                
+                # Plot both lines on the same axis
+                self.pred_ax.plot(x_axis, df['actual'], label='Actual', color='blue', alpha=0.7, linewidth=2)
+                self.pred_ax.plot(x_axis, df['predicted'], label='Predicted', color='red', alpha=0.7, linewidth=2)
+                
+                # Calculate and display correlation
+                correlation = np.corrcoef(df['actual'], df['predicted'])[0, 1]
+                self.pred_ax.text(0.02, 0.98, f'Correlation: {correlation:.4f}', 
+                                transform=self.pred_ax.transAxes, va='top', fontsize=10,
+                                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+                
+                # Calculate error metrics
+                mae = np.mean(np.abs(df['actual'] - df['predicted']))
+                mse = np.mean((df['actual'] - df['predicted']) ** 2)
+                rmse = np.sqrt(mse)
+                
+                title = f"Prediction Results - MAE: {mae:.4f}, RMSE: {rmse:.4f}"
+                
+            elif 'prediction' in df.columns:
+                # Plot predictions only
+                x_axis = range(len(df))
+                self.pred_ax.plot(x_axis, df['prediction'], label='Prediction', color='green', linewidth=2)
+                title = 'Predictions'
+                
+            else:
+                # Plot first numeric column
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                if len(numeric_cols) > 0:
+                    x_axis = range(len(df))
+                    self.pred_ax.plot(x_axis, df[numeric_cols[0]], label=numeric_cols[0], color='purple', linewidth=2)
+                    title = f'Prediction Results: {numeric_cols[0]}'
+                else:
+                    # No numeric columns, show data info
+                    self.pred_ax.text(0.5, 0.5, f'No numeric data to plot\nFile: {os.path.basename(file_path)}\nShape: {df.shape}', 
+                                   transform=self.pred_ax.transAxes, ha='center', va='center', fontsize=12)
+                    self.pred_ax.set_title('Prediction File Info')
+                    self.pred_ax.axis('off')
+                    
+                    # Safe canvas update
+                    try:
+                        if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                            self.pred_canvas.draw_idle()
+                    except Exception as canvas_error:
+                        print(f"Canvas update error: {canvas_error}")
+                    return
+            
+            # Set plot properties with ticker name instead of "Sample"
+            self.pred_ax.set_title(title)
+            self.pred_ax.set_xlabel(ticker)
+            self.pred_ax.set_ylabel("Value")
+            self.pred_ax.legend()
+            self.pred_ax.grid(True, alpha=0.3)
+            
+            # Safe canvas update with error handling
+            try:
+                # Use draw_idle() instead of draw() to avoid recursion
+                if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                    self.pred_canvas.draw_idle()
+                    # Force a small delay to allow the canvas to update
+                    self.root.after(100, lambda: None)
+            except Exception as canvas_error:
+                print(f"Canvas update error: {canvas_error}")
+                # Try alternative update method
+                try:
+                    if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                        self.pred_canvas.flush_events()
+                except:
+                    pass
+            
+            # Update status
+            self.prediction_status_var.set(f"Loaded: {os.path.basename(file_path)} | Shape: {df.shape}")
+            
+            # Also update the status label
+            if hasattr(self, 'pred_status_label'):
+                self.pred_status_label.config(text=f"Loaded: {os.path.basename(file_path)} | Shape: {df.shape}")
+            
+        except Exception as e:
+            print(f"Error updating prediction results with data: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Show error message in the plot
+            try:
+                if hasattr(self, 'pred_ax') and self.pred_ax:
+                    self.pred_ax.clear()
+                    self.pred_ax.text(0.5, 0.5, f'Error loading prediction data:\n{str(e)}', 
+                                    ha='center', va='center', transform=self.pred_ax.transAxes,
+                                    fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+                    self.pred_ax.set_title("Prediction Results - Error")
+                    self.pred_ax.axis('off')
+                    
+                    # Safe canvas update
+                    try:
+                        if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                            self.pred_canvas.draw_idle()
+                    except Exception as canvas_error:
+                        print(f"Canvas update error: {canvas_error}")
+            except Exception as plot_error:
+                print(f"Error creating error plot: {plot_error}")
+            
+            self.prediction_status_var.set(f"Error displaying prediction data: {str(e)}")
+            
+            # Also update the status label
+            if hasattr(self, 'pred_status_label'):
+                self.pred_status_label.config(text=f"Error displaying prediction data: {str(e)}")
+
+    def update_prediction_results(self):
+        """Update the Prediction Results tab with prediction data and statistics."""
+        try:
+            if not self.selected_model_path or not self.data_file:
+                # Show placeholder if no model or data selected
+                if hasattr(self, 'pred_ax') and self.pred_ax:
+                    self.pred_ax.clear()
+                    self.pred_ax.text(0.5, 0.5, 'Select a model and data file to view predictions', 
+                                    ha='center', va='center', transform=self.pred_ax.transAxes,
+                                    fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+                    self.pred_ax.set_title("Prediction Results")
+                    self.pred_ax.axis('off')
+                    
+                    # Safe canvas update
+                    try:
+                        if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                            self.pred_canvas.draw_idle()
+                    except Exception as canvas_error:
+                        print(f"Canvas update error: {canvas_error}")
+                
+                # Update status label
+                if not self.selected_model_path:
+                    self.prediction_status_var.set("No model selected")
+                elif not self.data_file:
+                    self.prediction_status_var.set("No data file selected")
+                return
+            
+            # Look for prediction files in the model directory
+            pred_files = glob.glob(os.path.join(self.selected_model_path, 'predictions_*.csv'))
+            
+            # Also look for other possible prediction file patterns
+            all_csv_files = glob.glob(os.path.join(self.selected_model_path, '*.csv'))
+            
+            # Check if model directory exists and list its contents
+            if os.path.exists(self.selected_model_path):
+                model_contents = os.listdir(self.selected_model_path)
+            
+            if not pred_files:
+                # Show placeholder if no prediction files found
+                if hasattr(self, 'pred_ax') and self.pred_ax:
+                    self.pred_ax.clear()
+                    self.pred_ax.text(0.5, 0.5, 'No prediction files found.\nRun prediction to generate results.', 
+                                    ha='center', va='center', transform=self.pred_ax.transAxes,
+                                    fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
+                    self.pred_ax.set_title("Prediction Results")
+                    self.pred_ax.axis('off')
+                    
+                    # Safe canvas update
+                    try:
+                        if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                            self.pred_canvas.draw_idle()
+                    except Exception as canvas_error:
+                        print(f"Canvas update error: {canvas_error}")
+                
+                # Update status label
+                self.prediction_status_var.set("No prediction files found - run prediction first")
+                return
+            
+            # Use the latest prediction file
+            latest_pred_file = max(pred_files, key=os.path.getctime)
+            
+            # Load prediction data
+            import pandas as pd
+            df = pd.read_csv(latest_pred_file)
+            
+            # Clear the plot
+            if hasattr(self, 'pred_ax') and self.pred_ax:
+                self.pred_ax.clear()
+            else:
+                print("Warning: pred_ax not found, cannot update prediction results")
+                return
+            
+            # Determine what columns are available for plotting
+            has_close = 'close' in df.columns
+            has_predicted_close = 'predicted_close' in df.columns
+            has_actual = 'actual' in df.columns
+            has_predicted = 'predicted' in df.columns
+            
+            if has_close and has_predicted_close:
+                # Plot actual vs predicted close prices
+                x_axis = range(len(df))
+                self.pred_ax.plot(x_axis, df['close'], 'b-', label='Actual Close', alpha=0.7, linewidth=2)
+                self.pred_ax.plot(x_axis, df['predicted_close'], 'r-', label='Predicted Close', alpha=0.7, linewidth=2)
+                
+                # Calculate and display correlation
+                correlation = np.corrcoef(df['close'], df['predicted_close'])[0, 1]
+                self.pred_ax.text(0.02, 0.98, f'Correlation: {correlation:.4f}', 
+                                transform=self.pred_ax.transAxes, va='top', fontsize=10,
+                                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+                
+                # Calculate error metrics
+                mae = np.mean(np.abs(df['close'] - df['predicted_close']))
+                mse = np.mean((df['close'] - df['predicted_close']) ** 2)
+                rmse = np.sqrt(mse)
+                
+                # Add metrics to title
+                title = f"Prediction Results - MAE: ${mae:.2f}, RMSE: ${rmse:.2f}"
+                
+                # Update status label
+                self.prediction_status_var.set(f"Showing {len(df)} predictions - MAE: ${mae:.2f}, Correlation: {correlation:.4f}")
+                
+            elif has_actual and has_predicted:
+                # Plot actual vs predicted values
+                x_axis = range(len(df))
+                self.pred_ax.plot(x_axis, df['actual'], 'b-', label='Actual', alpha=0.7, linewidth=2)
+                self.pred_ax.plot(x_axis, df['predicted'], 'r-', label='Predicted', alpha=0.7, linewidth=2)
+                
+                # Calculate and display correlation
+                correlation = np.corrcoef(df['actual'], df['predicted'])[0, 1]
+                self.pred_ax.text(0.02, 0.98, f'Correlation: {correlation:.4f}', 
+                                transform=self.pred_ax.transAxes, va='top', fontsize=10,
+                                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+                
+                # Calculate error metrics
+                mae = np.mean(np.abs(df['actual'] - df['predicted']))
+                mse = np.mean((df['actual'] - df['predicted']) ** 2)
+                rmse = np.sqrt(mse)
+                
+                # Add metrics to title
+                title = f"Prediction Results - MAE: {mae:.4f}, RMSE: {rmse:.4f}"
+                
+                # Update status label
+                self.prediction_status_var.set(f"Showing {len(df)} predictions - MAE: {mae:.4f}, Correlation: {correlation:.4f}")
+                
+            else:
+                # Show available columns for debugging
+                self.pred_ax.text(0.5, 0.5, f'Available columns: {list(df.columns)}\nNo standard prediction columns found', 
+                                ha='center', va='center', transform=self.pred_ax.transAxes,
+                                fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+                title = "Prediction Results - Column Format Issue"
+                
+                # Update status label
+                self.prediction_status_var.set(f"Column format issue - found: {list(df.columns)}")
+            
+            # Set plot properties
+            self.pred_ax.set_title(title)
+            self.pred_ax.set_xlabel(self.get_ticker_from_filename())
+            self.pred_ax.set_ylabel("Value")
+            self.pred_ax.legend()
+            self.pred_ax.grid(True, alpha=0.3)
+            
+            # Safe canvas update with error handling
+            try:
+                # Use draw_idle() instead of draw() to avoid recursion
+                if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                    self.pred_canvas.draw_idle()
+                    # Force a small delay to allow the canvas to update
+                    self.root.after(100, lambda: None)
+            except Exception as canvas_error:
+                print(f"Canvas update error: {canvas_error}")
+                # Try alternative update method
+                try:
+                    self.pred_canvas.flush_events()
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error updating prediction results: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Show error message in the plot
+            try:
+                if hasattr(self, 'pred_ax') and self.pred_ax:
+                    self.pred_ax.clear()
+                    self.pred_ax.text(0.5, 0.5, f'Error updating prediction results:\n{str(e)}', 
+                                    ha='center', va='center', transform=self.pred_ax.transAxes,
+                                    fontsize=10, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightcoral"))
+                    self.pred_ax.set_title("Prediction Results - Error")
+                    self.pred_ax.axis('off')
+                    
+                    # Safe canvas update
+                    try:
+                        if hasattr(self, 'pred_canvas') and self.pred_canvas:
+                            self.pred_canvas.draw_idle()
+                    except Exception as canvas_error:
+                        print(f"Canvas update error: {canvas_error}")
+            except Exception as plot_error:
+                print(f"Error creating error plot: {plot_error}")
+            
+            self.prediction_status_var.set(f"Error updating prediction results: {str(e)}")
+
+    def refresh_models(self, load_plots=True):
         """Refresh the list of available models and update plots."""
         try:
             # Clear existing models from combobox
@@ -1325,7 +2890,8 @@ class StockPredictionGUI:
             if not os.path.exists(self.current_model_dir):
                 os.makedirs(self.current_model_dir, exist_ok=True)
                 self.status_var.set(f"Created models directory: {self.current_model_dir}")
-                self.load_saved_plots()
+                if load_plots:
+                    self.load_saved_plots()
                 return
             
             model_dirs = sorted([
@@ -1338,10 +2904,15 @@ class StockPredictionGUI:
             
             if model_dirs:
                 self.model_combo.set(model_dirs[0])
-                self.on_model_select(None)  # Trigger plot loading
+                if load_plots:
+                    self.on_model_select(None)  # Trigger plot loading
             else:
                 self.status_var.set("No models available")
-                self.load_saved_plots()
+                if load_plots:
+                    self.load_saved_plots()
+            
+            # --- ADD THIS LINE ---
+            self.refresh_prediction_files()
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to refresh model list: {str(e)}")
@@ -1377,8 +2948,21 @@ class StockPredictionGUI:
             self.create_3d_gradient_descent_visualization(train_losses)
             self.switch_to_tab(4)  # 3D Gradient Descent tab
             
-            messagebox.showinfo("Success", f"Model training completed successfully!\nModel saved in: {model_dir}\n3D gradient descent visualization created!")
+            # Set the newly trained model as selected
             self.selected_model_path = model_dir
+            
+            # Automatically make a prediction with the newly trained model
+            if self.data_file:
+                print("Training completed - making automatic prediction...")
+                self.status_var.set("Training completed - making automatic prediction...")
+                
+                # Use after() to schedule the automatic prediction to run after GUI updates
+                self.root.after(1000, self.auto_make_prediction)
+            else:
+                print("Training completed - no data file selected for automatic prediction")
+                self.status_var.set("Training completed - select data file for prediction")
+            
+            messagebox.showinfo("Success", f"Model training completed successfully!\nModel saved in: {model_dir}\n3D gradient descent visualization created!")
             
         except Exception as e:
             print(f"Error in training completion: {e}")
@@ -1404,7 +2988,13 @@ class StockPredictionGUI:
             self.results_ax.set_ylabel("Loss")
             self.results_ax.legend()
             self.results_ax.grid(True)
-            self.results_canvas.draw()
+            
+            # Safe canvas update
+            try:
+                self.results_canvas.draw_idle()
+            except Exception as canvas_error:
+                print(f"Canvas update error in training results: {canvas_error}")
+                
         except Exception as e:
             print(f"Error updating training results: {e}")
     
@@ -1426,7 +3016,11 @@ class StockPredictionGUI:
             self.plots_ax.legend()
             self.plots_ax.grid(True, alpha=0.3)
             
-            self.plots_canvas.draw()
+            # Safe canvas update
+            try:
+                self.plots_canvas.draw_idle()
+            except Exception as canvas_error:
+                print(f"Canvas update error in plots tab: {canvas_error}")
             
             # Check for PNG plots and display them in the Saved Plots tab
             plot_files = []
@@ -1477,7 +3071,16 @@ class StockPredictionGUI:
                                 fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
                 self.gd3d_ax.set_title("3D Gradient Descent Visualization")
                 self.gd3d_ax.axis('off')
-                self.gd3d_canvas.draw()
+                
+                # Update frame label to show no frames
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text="Frame: 0/0")
+                
+                # Safe canvas update
+                try:
+                    self.gd3d_canvas.draw_idle()
+                except Exception as canvas_error:
+                    print(f"Canvas update error in 3D tab: {canvas_error}")
                 return
             
             plots_dir = os.path.join(self.selected_model_path, 'plots')
@@ -1486,10 +3089,21 @@ class StockPredictionGUI:
             print(f"Found {len(gd3d_files)} 3D visualization files: {[os.path.basename(f) for f in gd3d_files]}")
             
             if gd3d_files:
+                # Update animation variables
+                self.total_frames = len(gd3d_files)
+                self.current_frame = 0
+                
+                # Update frame label
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text=f"Frame: 1/{self.total_frames}")
+                
                 # Load the last frame (most complete visualization)
                 latest_frame = gd3d_files[-1]
                 print(f"Loading latest 3D visualization: {os.path.basename(latest_frame)}")
                 self.load_3d_visualization_image(latest_frame)
+                
+                # Update status
+                self.status_var.set(f"3D visualization loaded: {self.total_frames} frames available")
             else:
                 print("No 3D visualization files found in plots directory")
                 # Show a placeholder message
@@ -1499,7 +3113,16 @@ class StockPredictionGUI:
                                 fontsize=12, bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow"))
                 self.gd3d_ax.set_title("3D Gradient Descent Visualization")
                 self.gd3d_ax.axis('off')
-                self.gd3d_canvas.draw()
+                
+                # Update frame label to show no frames
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text="Frame: 0/0")
+                
+                # Safe canvas update
+                try:
+                    self.gd3d_canvas.draw_idle()
+                except Exception as canvas_error:
+                    print(f"Canvas update error in 3D tab: {canvas_error}")
                 
         except Exception as e:
             print(f"Error updating 3D gradient descent tab: {e}")
@@ -1534,8 +3157,11 @@ class StockPredictionGUI:
             self.gd3d_ax.set_title(f"3D Gradient Descent Visualization\n{os.path.basename(image_path)}")
             self.gd3d_ax.axis('off')
             
-            # Refresh the canvas
-            self.gd3d_canvas.draw()
+            # Safe canvas update
+            try:
+                self.gd3d_canvas.draw_idle()
+            except Exception as canvas_error:
+                print(f"Canvas update error in 3D visualization: {canvas_error}")
             
             print(f"Loaded 3D visualization image: {os.path.basename(image_path)} (resized to {new_size[0]}x{new_size[1]} - {scale*100}% of original)")
             
@@ -1544,156 +3170,226 @@ class StockPredictionGUI:
             import traceback
             traceback.print_exc()
 
-    def display_plotly_loss(self, train_losses=None, val_losses=None):
-        """Display interactive loss plot using plotly if available."""
-        if not PLOTLY_AVAILABLE:
-            messagebox.showwarning("Plotly Not Available", 
-                                 "Plotly is not installed. Please install it with 'pip install plotly' to use interactive plots.")
-            return
-        
-        try:
-            # Use provided losses or get from current model
-            if train_losses is None and self.selected_model_path:
-                loss_file = os.path.join(self.selected_model_path, 'training_losses.csv')
-                if os.path.exists(loss_file):
-                    losses = np.loadtxt(loss_file, delimiter=',')
-                    if losses.ndim > 1:
-                        train_losses = losses[:, 0]  # Training losses
-                        val_losses = losses[:, 1] if losses.shape[1] > 1 else None
-                    else:
-                        train_losses = losses
-                        val_losses = None
-            
-            if train_losses is None:
-                messagebox.showwarning("No Data", "No training loss data available to plot.")
-                return
-            
-            # Create plotly figure
-            fig = go.Figure()
-            
-            epochs = list(range(1, len(train_losses) + 1))
-            
-            # Add training loss trace
-            fig.add_trace(go.Scatter(
-                x=epochs,
-                y=train_losses,
-                mode='lines+markers',
-                name='Training Loss',
-                line=dict(color='blue', width=2),
-                marker=dict(size=6)
-            ))
-            
-            # Add validation loss trace if available
-            if val_losses is not None and len(val_losses) == len(train_losses):
-                fig.add_trace(go.Scatter(
-                    x=epochs,
-                    y=val_losses,
-                    mode='lines+markers',
-                    name='Validation Loss',
-                    line=dict(color='red', width=2),
-                    marker=dict(size=6)
-                ))
-            
-            # Update layout
-            ticker = self.get_ticker_from_filename()
-            fig.update_layout(
-                title=f'Interactive Training Loss ({ticker})',
-                xaxis_title='Epoch',
-                yaxis_title='Loss',
-                hovermode='x unified',
-                showlegend=True,
-                template='plotly_white'
-            )
-            
-            # Show the plot
-            fig.show()
-            
-        except Exception as e:
-            print(f"Error creating plotly plot: {e}")
             messagebox.showerror("Error", f"Failed to create interactive plot: {str(e)}")
 
     def open_live_training_plot(self):
-        """Open a live training plot window using Plotly."""
-        if not PLOTLY_AVAILABLE:
-            messagebox.showwarning("Plotly Not Available", 
-                                 "Plotly is not installed. Please install it with 'pip install plotly' to use live plots.")
-            return
-        
+        """Open a live training plot window using Matplotlib."""
         try:
-            # Initialize live plot data
+            # Close any existing plot first
+            if hasattr(self, 'live_plot_fig') and self.live_plot_fig is not None:
+                try:
+                    plt.close(self.live_plot_fig)
+                except:
+                    pass
+            
+            # Create a new matplotlib window with error handling
+            try:
+                self.live_plot_fig, self.live_plot_ax = plt.subplots(figsize=(10, 6))
+            except Exception as fig_error:
+                print(f"Error creating figure: {fig_error}")
+                raise
+            
+            self.live_plot_window_open = True
             self.live_plot_epochs = []
             self.live_plot_losses = []
-            self.live_plot_window_open = True
             
-            # Create initial plotly figure
-            self.live_plot_fig = go.Figure()
-            self.live_plot_fig.add_trace(go.Scatter(
-                x=self.live_plot_epochs,
-                y=self.live_plot_losses,
-                mode='lines+markers',
-                name='Training Loss',
-                line=dict(color='blue', width=2),
-                marker=dict(size=6)
-            ))
+            # Set up the plot with error handling
+            try:
+                ticker = self.get_ticker_from_filename()
+                self.live_plot_ax.set_title(f'Live Training Loss ({ticker})')
+                self.live_plot_ax.set_xlabel('Epoch')
+                self.live_plot_ax.set_ylabel('Loss')
+                self.live_plot_ax.grid(True, alpha=0.3)
+                
+                # Set initial limits
+                self.live_plot_ax.set_xlim(0, 10)
+                self.live_plot_ax.set_ylim(0, 1)
+                
+            except Exception as setup_error:
+                print(f"Error setting up plot: {setup_error}")
+                # Continue anyway, the plot will still work
             
-            # Update layout
-            ticker = self.get_ticker_from_filename()
-            self.live_plot_fig.update_layout(
-                title=f'Live Training Loss ({ticker})',
-                xaxis_title='Epoch',
-                yaxis_title='Loss',
-                hovermode='x unified',
-                showlegend=True,
-                template='plotly_white',
-                updatemenus=[{
-                    'type': 'buttons',
-                    'showactive': False,
-                    'buttons': [{
-                        'label': 'Pause',
-                        'method': 'relayout',
-                        'args': [{'updatemenus[0].buttons[0].label': 'Resume'}]
-                    }]
-                }]
-            )
-            
-            # Show the plot
-            self.live_plot_fig.show()
+            # Show the plot in non-blocking mode with error handling
+            try:
+                plt.show(block=False)
+                # Give the plot a moment to initialize
+                plt.pause(0.1)
+            except Exception as show_error:
+                print(f"Error showing plot: {show_error}")
+                # Try alternative method
+                try:
+                    self.live_plot_fig.show()
+                except:
+                    pass
             
             self.live_plot_status.config(text="Live training plot opened. Training progress will be shown here.")
             print("Live training plot opened successfully")
             
         except Exception as e:
             print(f"Error opening live training plot: {e}")
+            import traceback
+            traceback.print_exc()
             self.live_plot_window_open = False
+            self.live_plot_fig = None
+            self.live_plot_ax = None
             messagebox.showerror("Error", f"Failed to open live training plot: {str(e)}")
 
     def update_live_plot(self, epoch, loss):
-        """Update the live training plot with new data."""
-        if not self.live_plot_window_open or not PLOTLY_AVAILABLE:
+        """Update the live matplotlib plot with new data."""
+        if not self.live_plot_window_open:
             return
         
+        # Rate limiting: only update if enough time has passed
+        import time
+        current_time = time.time()
+        if current_time - self.last_plot_update < self.plot_update_interval:
+            # Store the data but don't update the plot yet
+            if epoch not in self.live_plot_epochs:
+                self.live_plot_epochs.append(epoch)
+                self.live_plot_losses.append(loss)
+            return
+        
+        self.last_plot_update = current_time
+        
         try:
-            # Add new data point
-            self.live_plot_epochs.append(epoch)
-            self.live_plot_losses.append(loss)
+            # Add new data point (if not already added)
+            if epoch not in self.live_plot_epochs:
+                self.live_plot_epochs.append(epoch)
+                self.live_plot_losses.append(loss)
             
-            # Update the plotly figure
-            self.live_plot_fig.data[0].x = self.live_plot_epochs
-            self.live_plot_fig.data[0].y = self.live_plot_losses
+            # Check if the plot window is still valid
+            if not hasattr(self, 'live_plot_fig') or self.live_plot_fig is None:
+                print("Live plot figure is no longer valid")
+                self.live_plot_window_open = False
+                return
             
-            # Update the plot
-            self.live_plot_fig.update_layout(
-                xaxis=dict(range=[0, max(self.live_plot_epochs) + 1]),
-                yaxis=dict(range=[min(self.live_plot_losses) * 0.95, max(self.live_plot_losses) * 1.05])
-            )
+            # Check if the figure is still valid
+            if not plt.fignum_exists(self.live_plot_fig.number):
+                print("Live plot window was closed")
+                self.live_plot_window_open = False
+                return
             
-            # Force update
-            self.live_plot_fig.update()
+            # Clear and redraw the plot with error handling
+            try:
+                self.live_plot_ax.clear()
+                self.live_plot_ax.plot(self.live_plot_epochs, self.live_plot_losses, 'b-', linewidth=2, marker='o', markersize=4)
+                
+                # Update labels and title
+                ticker = self.get_ticker_from_filename()
+                self.live_plot_ax.set_title(f'Live Training Loss ({ticker})')
+                self.live_plot_ax.set_xlabel('Epoch')
+                self.live_plot_ax.set_ylabel('Loss')
+                self.live_plot_ax.grid(True, alpha=0.3)
+                
+                # Auto-scale the axes with bounds checking
+                if len(self.live_plot_epochs) > 1:
+                    self.live_plot_ax.set_xlim(0, max(self.live_plot_epochs) + 1)
+                    if len(self.live_plot_losses) > 1:
+                        min_loss = min(self.live_plot_losses)
+                        max_loss = max(self.live_plot_losses)
+                        if max_loss > min_loss:  # Avoid division by zero
+                            margin = (max_loss - min_loss) * 0.1
+                            self.live_plot_ax.set_ylim(min_loss - margin, max_loss + margin)
+                        else:
+                            # If all losses are the same, set a small range
+                            self.live_plot_ax.set_ylim(min_loss - 0.1, min_loss + 0.1)
+                
+            except Exception as plot_error:
+                print(f"Error updating plot data: {plot_error}")
+                return
             
-            print(f"Live plot updated: Epoch {epoch}, Loss {loss:.6f}")
+            # Safe canvas update with multiple fallback methods
+            update_success = False
+            
+            # Method 1: Try draw_idle()
+            try:
+                self.live_plot_fig.canvas.draw_idle()
+                update_success = True
+            except Exception as e1:
+                print(f"draw_idle() failed: {e1}")
+                
+                # Method 2: Try flush_events()
+                try:
+                    self.live_plot_fig.canvas.flush_events()
+                    update_success = True
+                except Exception as e2:
+                    print(f"flush_events() failed: {e2}")
+                    
+                    # Method 3: Try basic draw() with error handling
+                    try:
+                        self.live_plot_fig.canvas.draw()
+                        update_success = True
+                    except Exception as e3:
+                        print(f"draw() failed: {e3}")
+                        
+                        # Method 4: Try to recreate the plot
+                        try:
+                            print("Attempting to recreate live plot...")
+                            self.close_live_plot()
+                            self.open_live_training_plot()
+                            # Re-add all data points
+                            for e, l in zip(self.live_plot_epochs, self.live_plot_losses):
+                                self.update_live_plot(e, l)
+                            update_success = True
+                        except Exception as e4:
+                            print(f"Plot recreation failed: {e4}")
+                            self.live_plot_window_open = False
+            
+            if update_success:
+                print(f"Live plot updated: Epoch {epoch}, Loss {loss:.6f}")
+            else:
+                print(f"Failed to update live plot for epoch {epoch}")
             
         except Exception as e:
             print(f"Error updating live plot: {e}")
+            import traceback
+            traceback.print_exc()
+            # If we get a serious error, close the plot to prevent further issues
+            try:
+                self.close_live_plot()
+            except:
+                pass
+
+    def close_live_plot(self):
+        """Close the live training plot."""
+        try:
+            self.live_plot_window_open = False
+            
+            if hasattr(self, 'live_plot_fig') and self.live_plot_fig is not None:
+                try:
+                    # Check if the figure still exists
+                    if plt.fignum_exists(self.live_plot_fig.number):
+                        plt.close(self.live_plot_fig)
+                except Exception as close_error:
+                    print(f"Error closing plot: {close_error}")
+                    # Try alternative closing method
+                    try:
+                        self.live_plot_fig.canvas.get_tk_widget().destroy()
+                    except:
+                        pass
+            
+            # Clean up variables
+            self.live_plot_fig = None
+            self.live_plot_ax = None
+            self.live_plot_epochs = []
+            self.live_plot_losses = []
+            
+            # Update status
+            try:
+                self.live_plot_status.config(text="Live training plot closed.")
+            except:
+                pass
+                
+            print("Live training plot closed")
+            
+        except Exception as e:
+            print(f"Error closing live plot: {e}")
+            # Force cleanup even if there's an error
+            self.live_plot_window_open = False
+            self.live_plot_fig = None
+            self.live_plot_ax = None
+            self.live_plot_epochs = []
+            self.live_plot_losses = []
 
     def parse_training_output_for_loss(self, line):
         """Parse training output line to extract epoch and loss information."""
@@ -1718,7 +3414,6 @@ class StockPredictionGUI:
                 if not hasattr(self, "live_gd_weights"):
                     self.live_gd_weights = []
                 self.live_gd_weights.append([w1_avg, w2_avg])
-                # Optionally update a live gradient descent plot here
                 return epoch, None
 
             # Legacy patterns
@@ -1746,18 +3441,816 @@ class StockPredictionGUI:
             print(f"Error parsing training output: {e}")
             return None, None
 
-    def close_live_plot(self):
-        """Close the live training plot."""
-        self.live_plot_window_open = False
-        self.live_plot_fig = None
-        self.live_plot_epochs = []
-        self.live_plot_losses = []
-        self.live_plot_status.config(text="Live training plot closed.")
-        print("Live training plot closed")
+    def auto_make_prediction(self):
+        """Automatically make a prediction and update the Prediction Results tab."""
+        try:
+            if not self.selected_model_path:
+                print("No model selected for automatic prediction")
+                return
+            
+            if not self.data_file:
+                print("No data file selected for automatic prediction")
+                return
+            
+            print("Making automatic prediction...")
+            self.status_var.set("Making automatic prediction...")
+            
+            # Run prediction using predict.py, saving results in the model directory
+            cmd = [
+                sys.executable, 'predict.py',
+                self.data_file,  # Input file as positional argument
+                '--model_dir', self.selected_model_path,
+                '--output_dir', self.selected_model_path  # Save in model directory
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"Automatic prediction failed: {result.stderr}")
+                self.status_var.set("Automatic prediction failed")
+                return
+            
+            print("Automatic prediction completed successfully!")
+            self.status_var.set("Automatic prediction completed")
+            
+            # Update the Prediction Results tab
+            self.update_prediction_results()
+            
+        except Exception as e:
+            print(f"Error in automatic prediction: {e}")
+            self.status_var.set(f"Automatic prediction failed: {str(e)}")
+
+    def select_data_file(self):
+        """Automatically select a suitable data file if available."""
+        try:
+            # Look for common data files in the current directory
+            data_files = []
+            for file in os.listdir('.'):
+                if file.endswith('.csv') and any(pattern in file.lower() for pattern in ['stock', 'price', 'data', 'tsla', 'aapl', 'msft']):
+                    data_files.append(file)
+            
+            if data_files:
+                # Use the first found data file
+                selected_file = data_files[0]
+                self.data_file = selected_file
+                self.data_file_var.set(selected_file)
+                self.load_data_features()
+                self.status_var.set(f"Auto-selected data file: {selected_file}")
+                return True
+            else:
+                self.status_var.set("No suitable data file found - please browse manually")
+                return False
+                
+        except Exception as e:
+            print(f"Error auto-selecting data file: {e}")
+            self.status_var.set(f"Error selecting data file: {str(e)}")
+            return False
+
+    # 3D Animation and Control Methods
+    def play_3d_animation(self):
+        """Start playing the 3D animation."""
+        try:
+            if not hasattr(self, 'gd3d_ax') or not self.gd3d_ax:
+                self.status_var.set("No 3D visualization available")
+                return
+            
+            if not hasattr(self, 'animation_running'):
+                self.animation_running = False
+            
+            if not self.animation_running:
+                self.animation_running = True
+                self.current_frame = 0
+                self.animate_3d_frames()
+                self.status_var.set("3D animation started")
+            else:
+                self.status_var.set("Animation already running")
+                
+        except Exception as e:
+            print(f"Error starting 3D animation: {e}")
+            self.status_var.set(f"Error starting animation: {str(e)}")
+
+    def pause_3d_animation(self):
+        """Pause the 3D animation."""
+        try:
+            if hasattr(self, 'animation_running'):
+                self.animation_running = False
+                self.status_var.set("3D animation paused")
+            else:
+                self.status_var.set("No animation running")
+                
+        except Exception as e:
+            print(f"Error pausing 3D animation: {e}")
+            self.status_var.set(f"Error pausing animation: {str(e)}")
+
+    def stop_3d_animation(self):
+        """Stop the 3D animation and reset to first frame."""
+        try:
+            if hasattr(self, 'animation_running'):
+                self.animation_running = False
+                self.current_frame = 0
+                self.load_3d_frame(0)
+                self.status_var.set("3D animation stopped")
+            else:
+                self.status_var.set("No animation running")
+                
+        except Exception as e:
+            print(f"Error stopping 3D animation: {e}")
+            self.status_var.set(f"Error stopping animation: {str(e)}")
+
+    def animate_3d_frames(self):
+        """Animate through 3D frames."""
+        try:
+            if not hasattr(self, 'animation_running') or not self.animation_running:
+                return
+            
+            if not hasattr(self, 'current_frame'):
+                self.current_frame = 0
+            
+            if not hasattr(self, 'total_frames'):
+                self.total_frames = self.get_total_3d_frames()
+            
+            if self.current_frame >= self.total_frames:
+                self.current_frame = 0
+            
+            # Load current frame
+            self.load_3d_frame(self.current_frame)
+            
+            # Update frame label
+            if hasattr(self, 'frame_label'):
+                self.frame_label.config(text=f"Frame: {self.current_frame + 1}/{self.total_frames}")
+            
+            # Schedule next frame
+            delay = int(1000 / (self.anim_speed_var.get() * 10))  # Convert speed to milliseconds
+            self.root.after(delay, self.animate_3d_frames)
+            
+            self.current_frame += 1
+            
+        except Exception as e:
+            print(f"Error in 3D animation: {e}")
+            self.animation_running = False
+
+    def get_total_3d_frames(self):
+        """Get the total number of 3D frames available."""
+        try:
+            if not self.selected_model_path:
+                return 0
+            
+            plots_dir = os.path.join(self.selected_model_path, 'plots')
+            if not os.path.exists(plots_dir):
+                return 0
+            
+            gd3d_files = glob.glob(os.path.join(plots_dir, 'gradient_descent_3d_frame_*.png'))
+            return len(gd3d_files)
+            
+        except Exception as e:
+            print(f"Error getting total 3D frames: {e}")
+            return 0
+
+    def load_3d_frame(self, frame_index):
+        """Load a specific 3D frame."""
+        try:
+            if not self.selected_model_path:
+                return
+            
+            plots_dir = os.path.join(self.selected_model_path, 'plots')
+            if not os.path.exists(plots_dir):
+                return
+            
+            gd3d_files = sorted(glob.glob(os.path.join(plots_dir, 'gradient_descent_3d_frame_*.png')))
+            
+            if 0 <= frame_index < len(gd3d_files):
+                frame_path = gd3d_files[frame_index]
+                self.load_3d_visualization_image(frame_path)
+                
+        except Exception as e:
+            print(f"Error loading 3D frame {frame_index}: {e}")
+
+    def prev_3d_frame(self):
+        """Go to previous 3D frame."""
+        try:
+            if not hasattr(self, 'current_frame'):
+                self.current_frame = 0
+            
+            total_frames = self.get_total_3d_frames()
+            if total_frames > 0:
+                self.current_frame = (self.current_frame - 1) % total_frames
+                self.load_3d_frame(self.current_frame)
+                
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text=f"Frame: {self.current_frame + 1}/{total_frames}")
+                
+                self.status_var.set(f"Frame {self.current_frame + 1}/{total_frames}")
+                
+        except Exception as e:
+            print(f"Error going to previous frame: {e}")
+            self.status_var.set(f"Error: {str(e)}")
+
+    def next_3d_frame(self):
+        """Go to next 3D frame."""
+        try:
+            if not hasattr(self, 'current_frame'):
+                self.current_frame = 0
+            
+            total_frames = self.get_total_3d_frames()
+            if total_frames > 0:
+                self.current_frame = (self.current_frame + 1) % total_frames
+                self.load_3d_frame(self.current_frame)
+                
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text=f"Frame: {self.current_frame + 1}/{total_frames}")
+                
+                self.status_var.set(f"Frame {self.current_frame + 1}/{total_frames}")
+                
+        except Exception as e:
+            print(f"Error going to next frame: {e}")
+            self.status_var.set(f"Error: {str(e)}")
+
+    def reset_3d_view(self):
+        """Reset the 3D view to default."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                self.current_3d_ax.view_init(elev=30, azim=45)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(30.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(45.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D view reset")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error resetting 3D view: {e}")
+            self.status_var.set(f"Error resetting view: {str(e)}")
+
+    def set_top_view(self):
+        """Set 3D view to top view."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                self.current_3d_ax.view_init(elev=90, azim=0)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(0.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(0.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D view: Top")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error setting top view: {e}")
+            self.status_var.set(f"Error setting view: {str(e)}")
+
+    def set_side_view(self):
+        """Set 3D view to side view."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                self.current_3d_ax.view_init(elev=0, azim=0)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(0.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(0.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D view: Side")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error setting side view: {e}")
+            self.status_var.set(f"Error setting view: {str(e)}")
+
+    def set_isometric_view(self):
+        """Set 3D view to isometric."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                self.current_3d_ax.view_init(elev=35.264, azim=45)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(0.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(45.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D view: Isometric")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error setting isometric view: {e}")
+            self.status_var.set(f"Error setting view: {str(e)}")
+
+    def rotate_x(self):
+        """Rotate 3D view around X axis."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                current_elev, current_azim = self.current_3d_ax.elev, self.current_3d_ax.azim
+                self.current_3d_ax.view_init(elev=current_elev + 15, azim=current_azim)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(current_elev + 15)
+                self.y_rotation_var.set(current_azim)
+                self.z_rotation_var.set(current_azim)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("Rotated around X axis")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error rotating X: {e}")
+            self.status_var.set(f"Error rotating: {str(e)}")
+
+    def rotate_y(self):
+        """Rotate 3D view around Y axis."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                current_elev, current_azim = self.current_3d_ax.elev, self.current_3d_ax.azim
+                self.current_3d_ax.view_init(elev=current_elev, azim=current_azim + 15)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(current_elev)
+                self.y_rotation_var.set(current_azim + 15)
+                self.z_rotation_var.set(current_azim + 15)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("Rotated around Y axis")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error rotating Y: {e}")
+            self.status_var.set(f"Error rotating: {str(e)}")
+
+    def rotate_z(self):
+        """Rotate 3D view around Z axis."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax and hasattr(self.current_3d_ax, 'view_init'):
+                current_elev, current_azim = self.current_3d_ax.elev, self.current_3d_ax.azim
+                self.current_3d_ax.view_init(elev=current_elev, azim=current_azim - 15)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(current_elev)
+                self.y_rotation_var.set(current_azim - 15)
+                self.z_rotation_var.set(current_azim - 15)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("Rotated around Z axis")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error rotating Z: {e}")
+            self.status_var.set(f"Error rotating: {str(e)}")
+
+    def zoom_in(self):
+        """Zoom in on 3D plot."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Get current limits
+                xlim = self.current_3d_ax.get_xlim()
+                ylim = self.current_3d_ax.get_ylim()
+                zlim = self.current_3d_ax.get_zlim()
+                
+                # Zoom in by reducing range
+                x_range = xlim[1] - xlim[0]
+                y_range = ylim[1] - ylim[0]
+                z_range = zlim[1] - zlim[0]
+                
+                self.current_3d_ax.set_xlim(xlim[0] + x_range * 0.1, xlim[1] - x_range * 0.1)
+                self.current_3d_ax.set_ylim(ylim[0] + y_range * 0.1, ylim[1] - y_range * 0.1)
+                self.current_3d_ax.set_zlim(zlim[0] + z_range * 0.1, zlim[1] - z_range * 0.1)
+                
+                # Update zoom slider
+                current_zoom = self.zoom_var.get()
+                self.zoom_var.set(min(5.0, current_zoom * 1.2))
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("Zoomed in")
+            else:
+                self.status_var.set("No 3D visualization available")
+                
+        except Exception as e:
+            print(f"Error zooming in: {e}")
+            self.status_var.set(f"Error zooming: {str(e)}")
+
+    def zoom_out(self):
+        """Zoom out the 3D visualization."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Get current view limits
+                xlim = self.current_3d_ax.get_xlim()
+                ylim = self.current_3d_ax.get_ylim()
+                zlim = self.current_3d_ax.get_zlim()
+                
+                # Calculate new limits (zoom out by 20%)
+                x_range = xlim[1] - xlim[0]
+                y_range = ylim[1] - ylim[0]
+                z_range = zlim[1] - zlim[0]
+                
+                x_center = (xlim[0] + xlim[1]) / 2
+                y_center = (ylim[0] + ylim[1]) / 2
+                z_center = (zlim[0] + zlim[1]) / 2
+                
+                new_x_range = x_range * 1.2
+                new_y_range = y_range * 1.2
+                new_z_range = z_range * 1.2
+                
+                self.current_3d_ax.set_xlim(x_center - new_x_range/2, x_center + new_x_range/2)
+                self.current_3d_ax.set_ylim(y_center - new_y_range/2, y_center + new_y_range/2)
+                self.current_3d_ax.set_zlim(z_center - new_z_range/2, z_center + new_z_range/2)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D visualization zoomed out")
+                
+        except Exception as e:
+            print(f"Error zooming out 3D visualization: {e}")
+            self.status_var.set(f"Error zooming out: {str(e)}")
+
+    def on_x_rotation_change(self, value):
+        """Handle X rotation slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Convert slider value to radians
+                angle = float(value) * np.pi / 180
+                
+                # Apply rotation to the 3D plot
+                self.current_3d_ax.view_init(elev=self.current_3d_ax.elev, azim=angle)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set(f"X rotation: {value}°")
+                
+        except Exception as e:
+            print(f"Error applying X rotation: {e}")
+
+    def on_y_rotation_change(self, value):
+        """Handle Y rotation slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Convert slider value to radians
+                angle = float(value) * np.pi / 180
+                
+                # Apply rotation to the 3D plot
+                self.current_3d_ax.view_init(elev=angle, azim=self.current_3d_ax.azim)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set(f"Y rotation: {value}°")
+                
+        except Exception as e:
+            print(f"Error applying Y rotation: {e}")
+
+    def on_z_rotation_change(self, value):
+        """Handle Z rotation slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Convert slider value to radians
+                angle = float(value) * np.pi / 180
+                
+                # Apply rotation to the 3D plot (Z rotation affects both elev and azim)
+                current_elev = self.current_3d_ax.elev
+                current_azim = self.current_3d_ax.azim
+                
+                # Apply Z rotation by adjusting both elevation and azimuth
+                new_elev = current_elev * np.cos(angle) - current_azim * np.sin(angle)
+                new_azim = current_elev * np.sin(angle) + current_azim * np.cos(angle)
+                
+                self.current_3d_ax.view_init(elev=new_elev, azim=new_azim)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set(f"Z rotation: {value}°")
+                
+        except Exception as e:
+            print(f"Error applying Z rotation: {e}")
+
+    def on_zoom_change(self, value):
+        """Handle zoom slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                zoom_level = float(value)
+                
+                # Get current view limits
+                xlim = self.current_3d_ax.get_xlim()
+                ylim = self.current_3d_ax.get_ylim()
+                zlim = self.current_3d_ax.get_zlim()
+                
+                # Calculate centers
+                x_center = (xlim[0] + xlim[1]) / 2
+                y_center = (ylim[0] + ylim[1]) / 2
+                z_center = (zlim[0] + zlim[1]) / 2
+                
+                # Calculate base ranges (assuming original zoom level of 1.0)
+                base_x_range = (xlim[1] - xlim[0]) / zoom_level
+                base_y_range = (ylim[1] - ylim[0]) / zoom_level
+                base_z_range = (zlim[1] - zlim[0]) / zoom_level
+                
+                # Apply new zoom level
+                new_x_range = base_x_range * zoom_level
+                new_y_range = base_y_range * zoom_level
+                new_z_range = base_z_range * zoom_level
+                
+                self.current_3d_ax.set_xlim(x_center - new_x_range/2, x_center + new_x_range/2)
+                self.current_3d_ax.set_ylim(y_center - new_y_range/2, y_center + new_y_range/2)
+                self.current_3d_ax.set_zlim(z_center - new_z_range/2, z_center + new_z_range/2)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set(f"Zoom level: {zoom_level:.2f}")
+                
+        except Exception as e:
+            print(f"Error applying zoom: {e}")
+
+    def on_camera_x_change(self, value):
+        """Handle camera X position slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                camera_x = float(value)
+                
+                # Get current camera position
+                current_pos = self.current_3d_ax.get_proj()
+                
+                # Update camera position (this is a simplified approach)
+                # In a real implementation, you might need to use different methods
+                # depending on the matplotlib version and backend
+                
+                self.status_var.set(f"Camera X: {camera_x}")
+                
+        except Exception as e:
+            print(f"Error applying camera X position: {e}")
+
+    def on_camera_y_change(self, value):
+        """Handle camera Y position slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                camera_y = float(value)
+                
+                # Get current camera position
+                current_pos = self.current_3d_ax.get_proj()
+                
+                # Update camera position (this is a simplified approach)
+                # In a real implementation, you might need to use different methods
+                # depending on the matplotlib version and backend
+                
+                self.status_var.set(f"Camera Y: {camera_y}")
+                
+        except Exception as e:
+            print(f"Error applying camera Y position: {e}")
+
+    def on_camera_z_change(self, value):
+        """Handle camera Z position slider change."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                camera_z = float(value)
+                
+                # Get current camera position
+                current_pos = self.current_3d_ax.get_proj()
+                
+                # Update camera position (this is a simplified approach)
+                # In a real implementation, you might need to use different methods
+                # depending on the matplotlib version and backend
+                
+                self.status_var.set(f"Camera Z: {camera_z}")
+                
+        except Exception as e:
+            print(f"Error applying camera Z position: {e}")
+
+    def on_frame_pos_change(self, value):
+        """Handle frame position slider change."""
+        try:
+            frame_pos = float(value)
+            
+            # Calculate frame index based on percentage
+            total_frames = self.get_total_3d_frames()
+            if total_frames > 0:
+                frame_index = int((frame_pos / 100.0) * (total_frames - 1))
+                frame_index = max(0, min(frame_index, total_frames - 1))
+                
+                # Load the frame
+                self.load_3d_frame(frame_index)
+                
+                # Update frame label if it exists
+                if hasattr(self, 'frame_label'):
+                    self.frame_label.config(text=f"Frame: {frame_index}/{total_frames-1}")
+                
+                self.status_var.set(f"Frame position: {frame_pos:.1f}% (Frame {frame_index})")
+            else:
+                self.status_var.set("No frames available")
+                
+        except Exception as e:
+            print(f"Error changing frame position: {e}")
+
+    def on_view_preset_change(self, event):
+        """Handle view preset listbox selection change."""
+        try:
+            # Get the selected item
+            selection = event.widget.curselection()
+            if selection:
+                preset_name = event.widget.get(selection[0])
+                
+                # Apply the selected view preset
+                if preset_name == "Default":
+                    self.reset_3d_view()
+                elif preset_name == "Top View":
+                    self.set_top_view()
+                elif preset_name == "Side View":
+                    self.set_side_view()
+                elif preset_name == "Isometric":
+                    self.set_isometric_view()
+                elif preset_name == "Front View":
+                    self.set_front_view()
+                elif preset_name == "Back View":
+                    self.set_back_view()
+                
+                self.status_var.set(f"View preset: {preset_name}")
+                
+        except Exception as e:
+            print(f"Error applying view preset: {e}")
+
+    def set_front_view(self):
+        """Set front view of the 3D visualization."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Set front view (elev=0, azim=0)
+                self.current_3d_ax.view_init(elev=0, azim=0)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(0.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(0.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D visualization set to front view")
+                
+        except Exception as e:
+            print(f"Error setting front view: {e}")
+            self.status_var.set(f"Error setting front view: {str(e)}")
+
+    def set_back_view(self):
+        """Set back view of the 3D visualization."""
+        try:
+            if hasattr(self, 'current_3d_ax') and self.current_3d_ax:
+                # Set back view (elev=0, azim=180)
+                self.current_3d_ax.view_init(elev=0, azim=180)
+                
+                # Update rotation sliders
+                self.x_rotation_var.set(0.0)
+                self.y_rotation_var.set(0.0)
+                self.z_rotation_var.set(180.0)
+                
+                # Update the canvas
+                if hasattr(self, 'current_3d_canvas') and self.current_3d_canvas:
+                    self.current_3d_canvas.draw()
+                
+                self.status_var.set("3D visualization set to back view")
+                
+        except Exception as e:
+            print(f"Error setting back view: {e}")
+            self.status_var.set(f"Error setting back view: {str(e)}")
+
+    def on_anim_speed_change(self, value):
+        """Handle animation speed slider change."""
+        try:
+            self.anim_speed_var.set(float(value))
+            self.status_var.set(f"Animation speed: {value}x")
+        except ValueError:
+            print(f"Invalid animation speed format: {value}")
+
+    def on_frame_rate_change(self, value):
+        """Handle frame rate slider change."""
+        try:
+            self.frame_rate_var.set(int(value))
+            self.status_var.set(f"Frame rate: {value} FPS")
+        except ValueError:
+            print(f"Invalid frame rate format: {value}")
+
+    def on_loop_mode_change(self, event):
+        """Handle loop mode listbox selection change."""
+        try:
+            # Get the selected item
+            selection = event.widget.curselection()
+            if selection:
+                self.loop_mode_var.set(event.widget.get(selection[0]))
+                self.status_var.set(f"Loop mode: {event.widget.get(selection[0])}")
+        except Exception as e:
+            print(f"Error handling loop mode change: {e}")
+
+    def on_playback_dir_change(self, event):
+        """Handle playback direction listbox selection change."""
+        try:
+            # Get the selected item
+            selection = event.widget.curselection()
+            if selection:
+                self.playback_dir_var.set(event.widget.get(selection[0]))
+                self.status_var.set(f"Playback direction: {event.widget.get(selection[0])}")
+        except Exception as e:
+            print(f"Error handling playback direction change: {e}")
+
+    def on_autoplay_change(self):
+        """Handle autoplay checkbox change."""
+        try:
+            self.autoplay_var.set(not self.autoplay_var.get())
+            self.status_var.set(f"Auto-play: {'Enabled' if self.autoplay_var.get() else 'Disabled'}")
+        except Exception as e:
+            print(f"Error handling autoplay change: {e}")
+
+    def on_anim_progress_change(self, value):
+        """Handle animation progress slider change."""
+        try:
+            progress = float(value)
+            self.anim_progress_var.set(progress)
+            # Calculate frame index based on percentage
+            total_frames = self.get_total_3d_frames()
+            if total_frames > 0:
+                frame_index = int((progress / 100.0) * (total_frames - 1))
+                frame_index = max(0, min(frame_index, total_frames - 1))
+                # Load the frame
+                self.load_3d_frame(frame_index)
+        except Exception as e:
+            print(f"Error updating animation progress: {e}")
+
+    def reset_3d_animation(self):
+        """Reset 3D animation to beginning."""
+        try:
+            # Reset animation progress
+            self.anim_progress_var.set(0.0)
+            
+            # Stop any ongoing animation
+            if hasattr(self, 'animation_running') and self.animation_running:
+                self.stop_3d_animation()
+            
+            # Load first frame
+            self.load_3d_frame(0)
+            
+            # Reset animation speed to default
+            self.anim_speed_var.set(1.0)
+            
+            # Reset frame position slider
+            if hasattr(self, 'frame_pos_var'):
+                self.frame_pos_var.set(0.0)
+            
+            self.status_var.set("3D animation reset to beginning")
+            
+        except Exception as e:
+            print(f"Error resetting 3D animation: {e}")
+            self.status_var.set(f"Error resetting animation: {str(e)}")
 
 # Main execution
 if __name__ == "__main__":
+    import sys
+    
+    # Check for test mode flag
+    test_mode = "--test_mode" in sys.argv
+    
     root = tk.Tk()
     app = StockPredictionGUI(root)
+    
+    if test_mode:
+        print("🧪 Running in TEST MODE - Live updates disabled")
+        app.status_var.set("TEST MODE - Live updates disabled")
+    
     root.mainloop()
         

@@ -153,6 +153,16 @@ class StockPredictor:
         if not os.path.exists(model_dir):
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
             
+        # Initialize normalization parameters to None by default
+        self.X_min = None
+        self.X_max = None
+        self.X_mean = None
+        self.X_std = None
+        self.Y_min = None
+        self.Y_max = None
+        self.use_standardization = False
+        self.has_target_norm = False
+        
         # Load all parameters from NPZ file
         weights_file = os.path.join(model_dir, 'stock_model.npz')
         if not os.path.exists(weights_file):
@@ -172,14 +182,44 @@ class StockPredictor:
             # Print hidden layer size
             print(f"Loaded model with hidden layer size: {self.W1.shape[1]}")
             
-            # Load normalization parameters
-            self.X_min = data['X_min']
-            self.X_max = data['X_max']
+            # Try to load normalization parameters from NPZ first
+            npz_has_norm = False
+            try:
+                # Check if normalization parameters exist in NPZ and are valid
+                if 'X_min' in data and 'X_max' in data:
+                    x_min = data['X_min']
+                    x_max = data['X_max']
+                    
+                    # Check if the values are valid (not None and not NaN)
+                    if x_min is not None and x_max is not None:
+                        # Convert to numpy arrays if they aren't already
+                        if not isinstance(x_min, np.ndarray):
+                            x_min = np.array(x_min)
+                        if not isinstance(x_max, np.ndarray):
+                            x_max = np.array(x_max)
+                        
+                        # Check for NaN values
+                        if not np.any(np.isnan(x_min)) and not np.any(np.isnan(x_max)):
+                            self.X_min = x_min
+                            self.X_max = x_max
+                            self.Y_min = data['Y_min'] if 'Y_min' in data else None
+                            self.Y_max = data['Y_max'] if 'Y_max' in data else None
+                            self.has_target_norm = bool(data['has_target_norm']) if 'has_target_norm' in data else False
+                            self.use_standardization = False
+                            npz_has_norm = True
+                            print("Loaded normalization parameters from NPZ file")
+                        else:
+                            print("Invalid normalization parameters in NPZ file (NaN values), loading from CSV files...")
+                    else:
+                        print("Invalid normalization parameters in NPZ file (None values), loading from CSV files...")
+                else:
+                    print("No normalization parameters in NPZ file, loading from CSV files...")
+            except Exception as e:
+                print(f"Error loading from NPZ: {e}, loading from CSV files...")
             
-            # Load target normalization parameters if they exist
-            self.Y_min = data['Y_min'] if data['Y_min'] is not None else None
-            self.Y_max = data['Y_max'] if data['Y_max'] is not None else None
-            self.has_target_norm = bool(data['has_target_norm'])
+            # If NPZ doesn't have valid normalization parameters, load from CSV files
+            if not npz_has_norm:
+                self._load_normalization_from_csv(model_dir)
             
             # Store architecture parameters
             self.input_size = int(data['input_size'])
@@ -195,6 +235,48 @@ class StockPredictor:
         else:
             self.expected_x_features = ['open', 'high', 'low', 'close', 'vol']
             self.expected_y_feature = 'close'
+
+    def _load_normalization_from_csv(self, model_dir):
+        """Load normalization parameters from separate CSV files."""
+        try:
+            # Load standardization parameters (mean and std)
+            scaler_mean_file = os.path.join(model_dir, 'scaler_mean.csv')
+            scaler_std_file = os.path.join(model_dir, 'scaler_std.csv')
+            
+            if os.path.exists(scaler_mean_file) and os.path.exists(scaler_std_file):
+                self.X_mean = np.loadtxt(scaler_mean_file)
+                self.X_std = np.loadtxt(scaler_std_file)
+                self.use_standardization = True
+                print(f"Loaded standardization parameters: mean={self.X_mean}, std={self.X_std}")
+            else:
+                # Fallback to min-max normalization if standardization files don't exist
+                self.use_standardization = False
+                print("Standardization files not found, using min-max normalization")
+            
+            # Load target normalization parameters
+            target_min_file = os.path.join(model_dir, 'target_min.csv')
+            target_max_file = os.path.join(model_dir, 'target_max.csv')
+            
+            if os.path.exists(target_min_file) and os.path.exists(target_max_file):
+                self.Y_min = np.loadtxt(target_min_file)
+                self.Y_max = np.loadtxt(target_max_file)
+                self.has_target_norm = True
+                print(f"Loaded target normalization: min={self.Y_min}, max={self.Y_max}")
+            else:
+                self.Y_min = None
+                self.Y_max = None
+                self.has_target_norm = False
+                print("Target normalization files not found")
+                
+        except Exception as e:
+            print(f"Error loading normalization parameters: {e}")
+            # Set default values to prevent crashes
+            self.X_mean = None
+            self.X_std = None
+            self.use_standardization = False
+            self.Y_min = None
+            self.Y_max = None
+            self.has_target_norm = False
 
     def forward(self, X):
         """
@@ -225,14 +307,26 @@ class StockPredictor:
             numpy.ndarray: Predicted values of shape (n_samples, 1)
         """
         # Normalize input data
-        X_norm = (X - self.X_min) / (self.X_max - self.X_min + 1e-8)
+        if self.use_standardization and self.X_mean is not None and self.X_std is not None:
+            # Use standardization (z-score normalization)
+            X_norm = (X - self.X_mean) / (self.X_std + 1e-8)
+            print(f"Using standardization: mean={self.X_mean}, std={self.X_std}")
+        elif self.X_min is not None and self.X_max is not None:
+            # Use min-max normalization
+            X_norm = (X - self.X_min) / (self.X_max - self.X_min + 1e-8)
+            print(f"Using min-max normalization: min={self.X_min}, max={self.X_max}")
+        else:
+            # No normalization available, use raw data
+            print("Warning: No normalization parameters found, using raw data")
+            X_norm = X
         
         # Get predictions
         predictions = self.forward(X_norm)
         
         # Denormalize predictions if target normalization parameters are available
-        if self.has_target_norm:
+        if self.has_target_norm and self.Y_min is not None and self.Y_max is not None:
             predictions = predictions * (self.Y_max - self.Y_min) + self.Y_min
+            print(f"Denormalized predictions using: min={self.Y_min}, max={self.Y_max}")
             
         return predictions.flatten()
 

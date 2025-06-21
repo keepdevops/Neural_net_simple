@@ -3,6 +3,8 @@
 
 This module creates a 3D visualization of the gradient descent process for neural network training,
 emphasizing the loss path as weights are updated, and saves PNG snapshots.
+
+Supports configuration via JSON file or command line arguments.
 """
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,6 +17,40 @@ import json
 from datetime import datetime
 import argparse
 import sys
+
+def load_config(config_file=None):
+    """Load configuration from JSON file or return default configuration."""
+    default_config = {
+        "visualization_settings": {
+            "model_dir": None,
+            "color": "viridis",
+            "point_size": 8,
+            "line_width": 3,
+            "surface_alpha": 0.6,
+            "w1_range": [-2.0, 2.0],
+            "w2_range": [-2.0, 2.0],
+            "n_points": 30,
+            "view_elev": 30.0,
+            "view_azim": 45.0,
+            "fps": 30,
+            "save_png": True,
+            "output_resolution": [1200, 800],
+            "w1_index": 0,
+            "w2_index": 0
+        }
+    }
+    
+    if config_file and os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            print(f"Loaded configuration from {config_file}")
+            return config
+        except Exception as e:
+            print(f"Error loading config file {config_file}: {e}")
+            print("Using default configuration")
+    
+    return default_config
 
 def find_latest_model_dir():
     """Find the most recent model directory."""
@@ -119,10 +155,28 @@ def compute_loss_surface(X, y, w1_range, w2_range, n_points=50):
     
     return W1, W2, Z
 
+def extract_weight_by_index(weights, index, layer='W1'):
+    """Extract a specific weight by index from the flattened weight array."""
+    try:
+        if layer == 'W1':
+            w_flat = weights['W1'].flatten()
+        else:
+            w_flat = weights['W2'].flatten()
+        
+        if 0 <= index < len(w_flat):
+            return w_flat[index]
+        else:
+            print(f"Warning: Index {index} out of range for {layer} (size: {len(w_flat)}), using index 0")
+            return w_flat[0] if len(w_flat) > 0 else 0.0
+    except (IndexError, KeyError, AttributeError) as e:
+        print(f"Warning: Could not extract weight at index {index} from {layer}: {e}")
+        return 0.0
+
 class GradientDescentVisualizer:
     def __init__(self, model_dir=None, w1_range=(-2, 2), w2_range=(-2, 2), n_points=50,
                  view_elev=30, view_azim=45, fps=30, color='viridis', point_size=8, 
-                 line_width=3, surface_alpha=0.6, output_resolution=(1200, 800)):
+                 line_width=3, surface_alpha=0.6, output_resolution=(1200, 800),
+                 w1_index=0, w2_index=0):
         self.model_dir = model_dir or find_latest_model_dir()
         self.w1_range = w1_range
         self.w2_range = w2_range
@@ -132,9 +186,11 @@ class GradientDescentVisualizer:
         self.fps = fps
         self.color = color
         self.point_size = point_size
-        self.line_width = line_width  # Increased for prominent loss path
+        self.line_width = line_width
         self.surface_alpha = surface_alpha
         self.output_resolution = output_resolution
+        self.w1_index = w1_index
+        self.w2_index = w2_index
         
         self.norm_params, self.history = load_training_data(self.model_dir)
         
@@ -192,8 +248,8 @@ class GradientDescentVisualizer:
         self.end_point = self.ax.plot([], [], [], 'bo', markersize=self.point_size + 2, 
                                     label='End')[0]
         
-        self.ax.set_xlabel('Weight 1')
-        self.ax.set_ylabel('Weight 2')
+        self.ax.set_xlabel(f'Weight 1 (Index {w1_index})')
+        self.ax.set_ylabel(f'Weight 2 (Index {w2_index})')
         self.ax.set_zlabel('Loss')
         self.ax.legend(loc='upper right')
         
@@ -223,13 +279,9 @@ class GradientDescentVisualizer:
         # Get weights for current frame with better error handling
         weights = self.history['weights'][min(frame, len(self.history['weights']) - 1)]
         
-        # Extract weights with proper shape handling
-        try:
-            w1 = weights['W1'].flatten()[0] if weights['W1'].size > 0 else 0.0
-            w2 = weights['W2'].flatten()[0] if weights['W2'].size > 0 else 0.0
-        except (IndexError, KeyError) as e:
-            print(f"Warning: Could not extract weights for frame {frame}: {e}")
-            w1, w2 = 0.0, 0.0
+        # Extract weights using specified indices
+        w1 = extract_weight_by_index(weights, self.w1_index, 'W1')
+        w2 = extract_weight_by_index(weights, self.w2_index, 'W2')
         
         loss = self.history['losses'][frame]
         
@@ -238,8 +290,8 @@ class GradientDescentVisualizer:
         for i in range(min(frame + 1, len(self.history['weights']))):
             try:
                 w = self.history['weights'][i]
-                x.append(w['W1'].flatten()[0] if w['W1'].size > 0 else 0.0)
-                y.append(w['W2'].flatten()[0] if w['W2'].size > 0 else 0.0)
+                x.append(extract_weight_by_index(w, self.w1_index, 'W1'))
+                y.append(extract_weight_by_index(w, self.w2_index, 'W2'))
             except (IndexError, KeyError) as e:
                 print(f"Warning: Could not extract weights for path point {i}: {e}")
                 x.append(0.0)
@@ -267,22 +319,18 @@ class GradientDescentVisualizer:
         if frame == 0 and x:
             self.start_point.set_data([x[0]], [y[0]])
             self.start_point.set_3d_properties([z[0]])
-            # Add annotation
-            self.ax.text(x[0], y[0], z[0], 'Start', color='green', fontsize=10)
         
         # Update end point (last epoch)
         if frame == len(self.history['losses']) - 1 and x:
             self.end_point.set_data([x[-1]], [y[-1]])
             self.end_point.set_3d_properties([z[-1]])
-            # Add annotation
-            self.ax.text(x[-1], y[-1], z[-1], 'End', color='blue', fontsize=10)
         
-        self.text.set_text(f'Epoch: {frame + 1}\nLoss: {loss:.6f}')
+        self.text.set_text(f'Epoch: {frame + 1}\nLoss: {loss:.6f}\nW1[{self.w1_index}]: {w1:.4f}\nW2[{self.w2_index}]: {w2:.4f}')
         
         return (self.progress_line, self.current_point, self.start_point, self.end_point, self.text)
 
     def save_plots(self, frames=[0, None, -1], plots_dir=None):
-        """Save PNG snapshots of the visualization at specified frames using grid layout."""
+        """Save PNG snapshots of the visualization at specified frames."""
         if plots_dir is None:
             plots_dir = os.path.join(self.model_dir, 'plots')
         os.makedirs(plots_dir, exist_ok=True)
@@ -308,7 +356,7 @@ class GradientDescentVisualizer:
             print(f"Saved plot: {filepath}")
 
     def animate(self, save_png=False):
-        """Create and display the animation, optionally saving PNGs using grid layout."""
+        """Create and display the animation, optionally saving PNGs."""
         if save_png:
             # Save plots at initial, middle, and final frames
             self.save_plots(frames=[0, None, -1])
@@ -337,22 +385,32 @@ class GradientDescentVisualizer:
 
 def main():
     parser = argparse.ArgumentParser(description='3D Gradient Descent Visualization')
+    parser.add_argument('--config', type=str, help='Path to JSON configuration file')
     parser.add_argument('--model_dir', type=str, help='Directory containing the model files')
     parser.add_argument('--color', type=str, default='viridis', help='Color map for the surface')
     parser.add_argument('--point_size', type=int, default=8, help='Size of the current point marker')
-    parser.add_argument('--line_width', type=int, default=2, help='Width of the gradient descent path')
+    parser.add_argument('--line_width', type=int, default=3, help='Width of the gradient descent path')
     parser.add_argument('--surface_alpha', type=float, default=0.6, help='Alpha transparency of the surface')
     parser.add_argument('--w1_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 1')
     parser.add_argument('--w2_range', type=float, nargs=2, default=[-2, 2], help='Range for weight 2')
-    parser.add_argument('--n_points', type=int, default=50, help='Number of points in surface grid')
+    parser.add_argument('--n_points', type=int, default=30, help='Number of points in surface grid')
     parser.add_argument('--view_elev', type=float, default=30, help='Initial elevation angle')
     parser.add_argument('--view_azim', type=float, default=45, help='Initial azimuth angle')
     parser.add_argument('--fps', type=int, default=30, help='Frames per second for animation')
     parser.add_argument('--save_png', action='store_true', help='Save PNG snapshots of visualization')
+    parser.add_argument('--w1_index', type=int, default=0, help='Index for W1 weight selection')
+    parser.add_argument('--w2_index', type=int, default=0, help='Index for W2 weight selection')
+    parser.add_argument('--output_resolution', type=int, nargs=2, default=[1200, 800], 
+                       help='Output resolution [width, height] in pixels')
     
     args = parser.parse_args()
     
-    model_dir = args.model_dir or find_latest_model_dir()
+    # Load configuration from file if provided
+    config = load_config(args.config)
+    viz_settings = config.get('visualization_settings', {})
+    
+    # Override config with command line arguments
+    model_dir = args.model_dir or viz_settings.get('model_dir') or find_latest_model_dir()
     
     try:
         visualizer = GradientDescentVisualizer(
@@ -366,7 +424,10 @@ def main():
             color=args.color,
             point_size=args.point_size,
             line_width=args.line_width,
-            surface_alpha=args.surface_alpha
+            surface_alpha=args.surface_alpha,
+            output_resolution=tuple(args.output_resolution),
+            w1_index=args.w1_index,
+            w2_index=args.w2_index
         )
         visualizer.animate(save_png=args.save_png)
     except Exception as e:
