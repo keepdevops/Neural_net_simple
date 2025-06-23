@@ -676,7 +676,97 @@ class StockPredictionGUI:
         plot_controls_frame.grid_columnconfigure(0, weight=1)
         plot_controls_frame.grid_rowconfigure(0, weight=1)
         
-        # Create a scrollable canvas for Plot Controls
+        # Help Tab
+        help_frame = ttk.Frame(self.control_notebook)
+        self.control_notebook.add(help_frame, text="?")
+        help_frame.grid_columnconfigure(0, weight=1)
+        help_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create help content
+        help_content_frame = ttk.Frame(help_frame)
+        help_content_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        help_content_frame.grid_columnconfigure(0, weight=1)
+        help_content_frame.grid_rowconfigure(1, weight=1)
+        
+        # Help title
+        help_title = ttk.Label(help_content_frame, text="Stock Prediction GUI - User Manual", 
+                              style="Bold.TLabel", font=("Arial", 14, "bold"))
+        help_title.grid(row=0, column=0, sticky="w", pady=(0, 10))
+        
+        # Create scrollable text widget for help content
+        help_text_frame = ttk.Frame(help_content_frame)
+        help_text_frame.grid(row=1, column=0, sticky="nsew")
+        help_text_frame.grid_columnconfigure(0, weight=1)
+        help_text_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create text widget with better configuration
+        help_text = tk.Text(help_text_frame, wrap=tk.WORD, width=50, height=20, 
+                           font=("Arial", 10), bg="white", relief=tk.SUNKEN,
+                           padx=10, pady=10, state=tk.NORMAL)
+        help_scrollbar = ttk.Scrollbar(help_text_frame, orient="vertical", command=help_text.yview)
+        help_text.configure(yscrollcommand=help_scrollbar.set)
+        
+        help_text.grid(row=0, column=0, sticky="nsew")
+        help_scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Insert help content immediately
+        help_content = self.get_help_content()
+        if help_content.strip():
+            help_text.insert(tk.END, help_content)
+            print(f"✅ Help tab: Inserted {len(help_content)} characters of help content")
+        else:
+            # Fallback content if help content is empty
+            fallback_content = """
+STOCK PREDICTION GUI - QUICK HELP
+================================
+
+OVERVIEW
+--------
+This GUI provides neural network-based stock price prediction with advanced visualization.
+
+QUICK START
+-----------
+1. Select a data file in the Data Selection tab
+2. Choose features and target variable
+3. Configure training parameters
+4. Click "Start Training"
+5. Monitor progress in Training Results tab
+6. Use Model Management for predictions
+
+TABS GUIDE
+----------
+• Data Selection: Load and configure data
+• Training Parameters: Set model parameters
+• Model Management: Load models and make predictions
+• Plot Controls: Configure 3D visualizations
+• Help (?): This help section
+
+For detailed information, use the buttons below.
+"""
+            help_text.insert(tk.END, fallback_content)
+            print("✅ Help tab: Inserted fallback help content")
+        
+        # Make read-only after inserting content
+        help_text.config(state=tk.DISABLED)
+        
+        # Force update to ensure content is displayed
+        help_text.update()
+        
+        # Add buttons at the bottom
+        help_buttons_frame = ttk.Frame(help_content_frame)
+        help_buttons_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        help_buttons_frame.grid_columnconfigure(0, weight=1)
+        help_buttons_frame.grid_columnconfigure(1, weight=1)
+        
+        print_manual_btn = ttk.Button(help_buttons_frame, text="Print Full Manual", 
+                                     command=self.print_full_manual)
+        print_manual_btn.grid(row=0, column=0, padx=(0, 5))
+        
+        open_manual_file_btn = ttk.Button(help_buttons_frame, text="Open Manual File", 
+                                         command=self.open_manual_file)
+        open_manual_file_btn.grid(row=0, column=1, padx=(5, 0))
+        
+        # Grid the canvas and scrollbar
         plot_canvas = tk.Canvas(plot_controls_frame, bg='white')
         plot_scrollbar = ttk.Scrollbar(plot_controls_frame, orient="vertical", command=plot_canvas.yview)
         plot_scrollable_frame = ttk.Frame(plot_canvas)
@@ -701,134 +791,169 @@ class StockPredictionGUI:
         
         # 3D Visualization parameters
         gd3d_label = ttk.Label(plot_scrollable_frame, text="3D Visualization Parameters:", style="Bold.TLabel")
-        gd3d_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
+        gd3d_label.grid(row=0, column=0, sticky="w", pady=(10, 15))
         
-        # Create a simple frame for 3D parameters (no scrollbar)
-        gd3d_inner_frame = ttk.Frame(plot_scrollable_frame)
-        gd3d_inner_frame.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        # Create a LabelFrame for 3D parameters with better organization
+        gd3d_inner_frame = ttk.LabelFrame(plot_scrollable_frame, text="Basic 3D Settings", padding="10")
+        gd3d_inner_frame.grid(row=1, column=0, sticky="ew", pady=(0, 20))
         gd3d_inner_frame.grid_columnconfigure(0, weight=1)
+        gd3d_inner_frame.grid_columnconfigure(1, weight=1)
         
-        # Color map
+        # Color map - Row 0
         color_label = ttk.Label(gd3d_inner_frame, text="Color Map:")
         color_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
         
         # Use combobox with valid colormap options
         valid_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'Reds', 'Blues', 'Greens', 'Oranges', 'Purples', 'RdYlBu', 'RdYlGn', 'Spectral', 'coolwarm', 'jet', 'hot', 'gray', 'bone', 'pink', 'spring', 'summer', 'autumn', 'winter']
-        color_combo = ttk.Combobox(gd3d_inner_frame, textvariable=self.color_var, values=valid_colormaps, width=15, state="readonly")
-        color_combo.grid(row=1, column=0, sticky="w", pady=(0, 10))
+        self.color_combo = ttk.Combobox(gd3d_inner_frame, textvariable=self.color_var, values=valid_colormaps, width=20, state="readonly")
+        self.color_combo.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 5))
         
-        # Point size
+        # Ensure the current value is displayed properly
+        try:
+            current_color = self.color_var.get()
+            print(f"🔍 Debug: color_var.get() = '{current_color}'")
+            
+            if current_color and current_color in valid_colormaps:
+                self.color_combo.set(current_color)
+                print(f"✅ Set combobox to existing value: '{current_color}'")
+            else:
+                # Set default value
+                default_color = 'viridis'
+                self.color_combo.set(default_color)
+                self.color_var.set(default_color)
+                print(f"✅ Set combobox to default value: '{default_color}'")
+            
+            # Force update the combobox display
+            self.color_combo.update()
+            
+        except Exception as e:
+            print(f"❌ Error setting color combobox: {e}")
+            # Fallback: set to viridis
+            self.color_combo.set('viridis')
+            self.color_var.set('viridis')
+        
+        print(f"✅ Color map combobox created with {len(valid_colormaps)} values")
+        print(f"✅ Current color value: '{self.color_var.get()}'")
+        print(f"✅ Combobox display value: '{self.color_combo.get()}'")
+        print(f"✅ Combobox values: {valid_colormaps[:5]}...")  # Show first 5 values
+        
+        # Point size and Line width - Row 1
         point_label = ttk.Label(gd3d_inner_frame, text="Point Size:")
-        point_label.grid(row=2, column=0, sticky="w", pady=(0, 5))
+        point_label.grid(row=1, column=0, sticky="w", pady=(10, 5))
         
-        point_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.point_size_var, width=10)
-        point_entry.grid(row=3, column=0, sticky="w", pady=(0, 10))
+        point_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.point_size_var, width=12)
+        point_entry.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(10, 5))
         
-        # Line width
+        # Line width - Row 2
         line_label = ttk.Label(gd3d_inner_frame, text="Line Width:")
-        line_label.grid(row=4, column=0, sticky="w", pady=(0, 5))
+        line_label.grid(row=2, column=0, sticky="w", pady=(10, 5))
         
-        line_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.line_width_var, width=10)
-        line_entry.grid(row=5, column=0, sticky="w", pady=(0, 10))
+        line_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.line_width_var, width=12)
+        line_entry.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(10, 5))
         
-        # Surface alpha
+        # Surface alpha - Row 3
         alpha_label = ttk.Label(gd3d_inner_frame, text="Surface Alpha:")
-        alpha_label.grid(row=6, column=0, sticky="w", pady=(0, 5))
+        alpha_label.grid(row=3, column=0, sticky="w", pady=(10, 5))
         
-        alpha_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.surface_alpha_var, width=10)
-        alpha_entry.grid(row=7, column=0, sticky="w", pady=(0, 10))
+        alpha_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.surface_alpha_var, width=12)
+        alpha_entry.grid(row=3, column=1, sticky="w", padx=(10, 0), pady=(10, 5))
         
-        # Weight ranges
-        w1_range_label = ttk.Label(gd3d_inner_frame, text="W1 Range [min, max]:")
-        w1_range_label.grid(row=8, column=0, sticky="w", pady=(0, 5))
-        
-        w1_range_frame = ttk.Frame(gd3d_inner_frame)
-        w1_range_frame.grid(row=9, column=0, sticky="w", pady=(0, 10))
-        w1_range_frame.grid_columnconfigure(0, weight=1)
-        w1_range_frame.grid_columnconfigure(1, weight=1)
-        
-        w1_min_entry = ttk.Entry(w1_range_frame, textvariable=self.w1_range_min_var, width=8)
-        w1_min_entry.grid(row=0, column=0, padx=(0, 5))
-        
-        w1_max_entry = ttk.Entry(w1_range_frame, textvariable=self.w1_range_max_var, width=8)
-        w1_max_entry.grid(row=0, column=1, padx=(5, 0))
-        
-        w2_range_label = ttk.Label(gd3d_inner_frame, text="W2 Range [min, max]:")
-        w2_range_label.grid(row=10, column=0, sticky="w", pady=(0, 5))
-        
-        w2_range_frame = ttk.Frame(gd3d_inner_frame)
-        w2_range_frame.grid(row=11, column=0, sticky="w", pady=(0, 10))
-        w2_range_frame.grid_columnconfigure(0, weight=1)
-        w2_range_frame.grid_columnconfigure(1, weight=1)
-        
-        w2_min_entry = ttk.Entry(w2_range_frame, textvariable=self.w2_range_min_var, width=8)
-        w2_min_entry.grid(row=0, column=0, padx=(0, 5))
-        
-        w2_max_entry = ttk.Entry(w2_range_frame, textvariable=self.w2_range_max_var, width=8)
-        w2_max_entry.grid(row=0, column=1, padx=(5, 0))
-        
-        # Grid points
+        # Grid points - Row 4
         n_points_label = ttk.Label(gd3d_inner_frame, text="Grid Points:")
-        n_points_label.grid(row=12, column=0, sticky="w", pady=(0, 5))
+        n_points_label.grid(row=4, column=0, sticky="w", pady=(10, 5))
         
-        n_points_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.n_points_var, width=10)
-        n_points_entry.grid(row=13, column=0, sticky="w", pady=(0, 10))
+        n_points_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.n_points_var, width=12)
+        n_points_entry.grid(row=4, column=1, sticky="w", padx=(10, 0), pady=(10, 5))
+        
+        # FPS - Row 5
+        fps_label = ttk.Label(gd3d_inner_frame, text="FPS:")
+        fps_label.grid(row=5, column=0, sticky="w", pady=(10, 5))
+        
+        fps_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.fps_var, width=12)
+        fps_entry.grid(row=5, column=1, sticky="w", padx=(10, 0), pady=(10, 5))
+        
+        # Weight Ranges Section
+        weight_ranges_frame = ttk.LabelFrame(plot_scrollable_frame, text="Weight Ranges", padding="10")
+        weight_ranges_frame.grid(row=2, column=0, sticky="ew", pady=(0, 20))
+        weight_ranges_frame.grid_columnconfigure(0, weight=1)
+        weight_ranges_frame.grid_columnconfigure(1, weight=1)
+        weight_ranges_frame.grid_columnconfigure(2, weight=1)
+        weight_ranges_frame.grid_columnconfigure(3, weight=1)
+        
+        # W1 Range
+        w1_range_label = ttk.Label(weight_ranges_frame, text="W1 Range [min, max]:")
+        w1_range_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        
+        w1_min_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w1_range_min_var, width=10)
+        w1_min_entry.grid(row=1, column=0, sticky="w", padx=(0, 5), pady=(0, 10))
+        
+        w1_max_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w1_range_max_var, width=10)
+        w1_max_entry.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=(0, 10))
+        
+        # W2 Range
+        w2_range_label = ttk.Label(weight_ranges_frame, text="W2 Range [min, max]:")
+        w2_range_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 5))
+        
+        w2_min_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w2_range_min_var, width=10)
+        w2_min_entry.grid(row=3, column=0, sticky="w", padx=(0, 5), pady=(0, 5))
+        
+        w2_max_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w2_range_max_var, width=10)
+        w2_max_entry.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=(0, 5))
+        
+        # Weight Indices
+        w1_index_label = ttk.Label(weight_ranges_frame, text="W1 Index:")
+        w1_index_label.grid(row=0, column=2, sticky="w", pady=(0, 5))
+        
+        w1_index_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w1_index_var, width=10)
+        w1_index_entry.grid(row=1, column=2, sticky="w", padx=(10, 0), pady=(0, 10))
+        
+        w2_index_label = ttk.Label(weight_ranges_frame, text="W2 Index:")
+        w2_index_label.grid(row=2, column=2, sticky="w", pady=(0, 5))
+        
+        w2_index_entry = ttk.Entry(weight_ranges_frame, textvariable=self.w2_index_var, width=10)
+        w2_index_entry.grid(row=3, column=2, sticky="w", padx=(10, 0), pady=(0, 5))
+        
+        # View Settings Section
+        view_settings_frame = ttk.LabelFrame(plot_scrollable_frame, text="View Settings", padding="10")
+        view_settings_frame.grid(row=3, column=0, sticky="ew", pady=(0, 20))
+        view_settings_frame.grid_columnconfigure(0, weight=1)
+        view_settings_frame.grid_columnconfigure(1, weight=1)
         
         # View angles
-        view_elev_label = ttk.Label(gd3d_inner_frame, text="View Elevation:")
-        view_elev_label.grid(row=14, column=0, sticky="w", pady=(0, 5))
+        view_elev_label = ttk.Label(view_settings_frame, text="View Elevation:")
+        view_elev_label.grid(row=0, column=0, sticky="w", pady=(0, 5))
         
-        view_elev_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.view_elev_var, width=10)
-        view_elev_entry.grid(row=15, column=0, sticky="w", pady=(0, 10))
+        view_elev_entry = ttk.Entry(view_settings_frame, textvariable=self.view_elev_var, width=12)
+        view_elev_entry.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 10))
         
-        view_azim_label = ttk.Label(gd3d_inner_frame, text="View Azimuth:")
-        view_azim_label.grid(row=16, column=0, sticky="w", pady=(0, 5))
+        view_azim_label = ttk.Label(view_settings_frame, text="View Azimuth:")
+        view_azim_label.grid(row=1, column=0, sticky="w", pady=(0, 5))
         
-        view_azim_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.view_azim_var, width=10)
-        view_azim_entry.grid(row=17, column=0, sticky="w", pady=(0, 10))
-        
-        # FPS
-        fps_label = ttk.Label(gd3d_inner_frame, text="FPS:")
-        fps_label.grid(row=18, column=0, sticky="w", pady=(0, 5))
-        
-        fps_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.fps_var, width=10)
-        fps_entry.grid(row=19, column=0, sticky="w", pady=(0, 10))
-        
-        # Weight indices
-        w1_index_label = ttk.Label(gd3d_inner_frame, text="W1 Index:")
-        w1_index_label.grid(row=20, column=0, sticky="w", pady=(0, 5))
-        
-        w1_index_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.w1_index_var, width=10)
-        w1_index_entry.grid(row=21, column=0, sticky="w", pady=(0, 10))
-        
-        w2_index_label = ttk.Label(gd3d_inner_frame, text="W2 Index:")
-        w2_index_label.grid(row=22, column=0, sticky="w", pady=(0, 5))
-        
-        w2_index_entry = ttk.Entry(gd3d_inner_frame, textvariable=self.w2_index_var, width=10)
-        w2_index_entry.grid(row=23, column=0, sticky="w", pady=(0, 10))
+        view_azim_entry = ttk.Entry(view_settings_frame, textvariable=self.view_azim_var, width=12)
+        view_azim_entry.grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(0, 10))
         
         # Output resolution
-        output_res_label = ttk.Label(gd3d_inner_frame, text="Output Resolution [width, height]:")
-        output_res_label.grid(row=24, column=0, sticky="w", pady=(0, 5))
+        output_res_label = ttk.Label(view_settings_frame, text="Output Resolution [width, height]:")
+        output_res_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 5))
         
-        output_res_frame = ttk.Frame(gd3d_inner_frame)
-        output_res_frame.grid(row=25, column=0, sticky="w", pady=(0, 10))
+        output_res_frame = ttk.Frame(view_settings_frame)
+        output_res_frame.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 5))
         output_res_frame.grid_columnconfigure(0, weight=1)
         output_res_frame.grid_columnconfigure(1, weight=1)
         
-        output_width_entry = ttk.Entry(output_res_frame, textvariable=self.output_width_var, width=8)
+        output_width_entry = ttk.Entry(output_res_frame, textvariable=self.output_width_var, width=10)
         output_width_entry.grid(row=0, column=0, padx=(0, 5))
         
-        output_height_entry = ttk.Entry(output_res_frame, textvariable=self.output_height_var, width=8)
+        output_height_entry = ttk.Entry(output_res_frame, textvariable=self.output_height_var, width=10)
         output_height_entry.grid(row=0, column=1, padx=(5, 0))
         
         # 3D Visualization Parameters Section
         gd3d_params_label = ttk.Label(plot_scrollable_frame, text="3D Visualization Parameters:", style="Bold.TLabel")
-        gd3d_params_label.grid(row=2, column=0, sticky="w", pady=(20, 5))
+        gd3d_params_label.grid(row=4, column=0, sticky="w", pady=(20, 15))
         
         # Create frame for 3D parameters
-        gd3d_params_frame = ttk.Frame(plot_scrollable_frame)
-        gd3d_params_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        gd3d_params_frame = ttk.LabelFrame(plot_scrollable_frame, text="Animation & Control Parameters", padding="10")
+        gd3d_params_frame.grid(row=5, column=0, sticky="ew", pady=(0, 20))
         gd3d_params_frame.grid_columnconfigure(0, weight=1)
         gd3d_params_frame.grid_columnconfigure(1, weight=1)
         
@@ -838,7 +963,7 @@ class StockPredictionGUI:
         
         self.anim_speed_var = tk.DoubleVar(value=1.0)
         anim_speed_scale = ttk.Scale(gd3d_params_frame, from_=0.1, to=5.0, variable=self.anim_speed_var, 
-                                    orient="horizontal", length=150)
+                                    orient="horizontal", length=200)
         anim_speed_scale.grid(row=0, column=1, sticky="w", padx=(10, 0))
         
         anim_speed_value_label = ttk.Label(gd3d_params_frame, textvariable=self.anim_speed_var)
@@ -846,11 +971,11 @@ class StockPredictionGUI:
         
         # Frame Position Control
         frame_pos_label = ttk.Label(gd3d_params_frame, text="Frame Position:")
-        frame_pos_label.grid(row=1, column=0, sticky="w", pady=(10, 2))
+        frame_pos_label.grid(row=1, column=0, sticky="w", pady=(15, 2))
         
         self.frame_pos_var = tk.DoubleVar(value=0.0)
         frame_pos_scale = ttk.Scale(gd3d_params_frame, from_=0, to=100, variable=self.frame_pos_var, 
-                                   orient="horizontal", length=150, command=self.on_frame_pos_change)
+                                   orient="horizontal", length=200, command=self.on_frame_pos_change)
         frame_pos_scale.grid(row=1, column=1, sticky="w", padx=(10, 0))
         
         frame_pos_value_label = ttk.Label(gd3d_params_frame, textvariable=self.frame_pos_var)
@@ -858,22 +983,22 @@ class StockPredictionGUI:
         
         # View Preset Control (replaced listbox with combobox)
         view_preset_label = ttk.Label(gd3d_params_frame, text="View Preset:")
-        view_preset_label.grid(row=2, column=0, sticky="w", pady=(10, 2))
+        view_preset_label.grid(row=2, column=0, sticky="w", pady=(15, 2))
         
         self.view_preset_var = tk.StringVar(value="Default")
         view_presets = ["Default", "Top View", "Side View", "Isometric", "Front View", "Back View"]
         view_preset_combo = ttk.Combobox(gd3d_params_frame, textvariable=self.view_preset_var, 
-                                        values=view_presets, width=15, state="readonly")
+                                        values=view_presets, width=20, state="readonly")
         view_preset_combo.grid(row=2, column=1, sticky="w", padx=(10, 0))
         view_preset_combo.bind('<<ComboboxSelected>>', self.on_view_preset_change)
         
         # X Rotation Control
         x_rot_label = ttk.Label(gd3d_params_frame, text="X Rotation:")
-        x_rot_label.grid(row=3, column=0, sticky="w", pady=(10, 2))
+        x_rot_label.grid(row=3, column=0, sticky="w", pady=(15, 2))
         
         self.x_rotation_var = tk.DoubleVar(value=0.0)
         x_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.x_rotation_var, 
-                               orient="horizontal", length=150, command=self.on_x_rotation_change)
+                               orient="horizontal", length=200, command=self.on_x_rotation_change)
         x_rot_scale.grid(row=3, column=1, sticky="w", padx=(10, 0))
         
         x_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.x_rotation_var)
@@ -881,11 +1006,11 @@ class StockPredictionGUI:
         
         # Y Rotation Control
         y_rot_label = ttk.Label(gd3d_params_frame, text="Y Rotation:")
-        y_rot_label.grid(row=4, column=0, sticky="w", pady=(10, 2))
+        y_rot_label.grid(row=4, column=0, sticky="w", pady=(15, 2))
         
         self.y_rotation_var = tk.DoubleVar(value=0.0)
         y_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.y_rotation_var, 
-                               orient="horizontal", length=150, command=self.on_y_rotation_change)
+                               orient="horizontal", length=200, command=self.on_y_rotation_change)
         y_rot_scale.grid(row=4, column=1, sticky="w", padx=(10, 0))
         
         y_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.y_rotation_var)
@@ -893,11 +1018,11 @@ class StockPredictionGUI:
         
         # Z Rotation Control
         z_rot_label = ttk.Label(gd3d_params_frame, text="Z Rotation:")
-        z_rot_label.grid(row=5, column=0, sticky="w", pady=(10, 2))
+        z_rot_label.grid(row=5, column=0, sticky="w", pady=(15, 2))
         
         self.z_rotation_var = tk.DoubleVar(value=0.0)
         z_rot_scale = ttk.Scale(gd3d_params_frame, from_=-180, to=180, variable=self.z_rotation_var, 
-                               orient="horizontal", length=150, command=self.on_z_rotation_change)
+                               orient="horizontal", length=200, command=self.on_z_rotation_change)
         z_rot_scale.grid(row=5, column=1, sticky="w", padx=(10, 0))
         
         z_rot_value_label = ttk.Label(gd3d_params_frame, textvariable=self.z_rotation_var)
@@ -905,11 +1030,11 @@ class StockPredictionGUI:
         
         # Zoom Control
         zoom_label = ttk.Label(gd3d_params_frame, text="Zoom Level:")
-        zoom_label.grid(row=6, column=0, sticky="w", pady=(10, 2))
+        zoom_label.grid(row=6, column=0, sticky="w", pady=(15, 2))
         
         self.zoom_var = tk.DoubleVar(value=1.0)
         zoom_scale = ttk.Scale(gd3d_params_frame, from_=0.1, to=5.0, variable=self.zoom_var, 
-                              orient="horizontal", length=150, command=self.on_zoom_change)
+                              orient="horizontal", length=200, command=self.on_zoom_change)
         zoom_scale.grid(row=6, column=1, sticky="w", padx=(10, 0))
         
         zoom_value_label = ttk.Label(gd3d_params_frame, textvariable=self.zoom_var)
@@ -917,7 +1042,7 @@ class StockPredictionGUI:
         
         # Camera Position Controls
         camera_label = ttk.Label(gd3d_params_frame, text="Camera Position:", style="Bold.TLabel")
-        camera_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(20, 5))
+        camera_label.grid(row=7, column=0, columnspan=2, sticky="w", pady=(25, 10))
         
         # Camera X position
         cam_x_label = ttk.Label(gd3d_params_frame, text="Camera X:")
@@ -925,7 +1050,7 @@ class StockPredictionGUI:
         
         self.camera_x_var = tk.DoubleVar(value=0.0)
         cam_x_scale = ttk.Scale(gd3d_params_frame, from_=-10, to=10, variable=self.camera_x_var, 
-                               orient="horizontal", length=150, command=self.on_camera_x_change)
+                               orient="horizontal", length=200, command=self.on_camera_x_change)
         cam_x_scale.grid(row=8, column=1, sticky="w", padx=(10, 0))
         
         cam_x_value_label = ttk.Label(gd3d_params_frame, textvariable=self.camera_x_var)
@@ -933,7 +1058,7 @@ class StockPredictionGUI:
         
         # Camera Y position
         cam_y_label = ttk.Label(gd3d_params_frame, text="Camera Y:")
-        cam_y_label.grid(row=9, column=0, sticky="w", pady=(5, 2))
+        cam_y_label.grid(row=9, column=0, sticky="w", pady=(15, 2))
         
         self.camera_y_var = tk.DoubleVar(value=0.0)
         cam_y_scale = ttk.Scale(gd3d_params_frame, from_=-10, to=10, variable=self.camera_y_var, 
@@ -956,111 +1081,8 @@ class StockPredictionGUI:
         cam_z_value_label.grid(row=10, column=1, sticky="e", padx=(0, 10))
         
         # Animation Controls Section
-        anim_controls_label = ttk.Label(plot_controls_frame, text="Animation Controls:", style="Bold.TLabel")
-        anim_controls_label.grid(row=4, column=0, sticky="w", pady=(20, 5))
-        
-        # Create frame for animation controls
-        anim_controls_frame = ttk.Frame(plot_controls_frame)
-        anim_controls_frame.grid(row=5, column=0, sticky="ew", pady=(0, 10))
-        anim_controls_frame.grid_columnconfigure(0, weight=1)
-        anim_controls_frame.grid_columnconfigure(1, weight=1)
-        
-        # Animation Speed Control (enhanced)
-        anim_speed_label = ttk.Label(anim_controls_frame, text="Animation Speed:")
-        anim_speed_label.grid(row=0, column=0, sticky="w", pady=(5, 2))
-        
-        self.anim_speed_var = tk.DoubleVar(value=1.0)
-        anim_speed_scale = ttk.Scale(anim_controls_frame, from_=0.1, to=5.0, variable=self.anim_speed_var, 
-                                    orient="horizontal", length=150, command=self.on_anim_speed_change)
-        anim_speed_scale.grid(row=0, column=1, sticky="w", padx=(10, 0))
-        
-        anim_speed_value_label = ttk.Label(anim_controls_frame, textvariable=self.anim_speed_var)
-        anim_speed_value_label.grid(row=0, column=1, sticky="e", padx=(0, 10))
-        
-        # Frame Rate Control
-        frame_rate_label = ttk.Label(anim_controls_frame, text="Frame Rate (FPS):")
-        frame_rate_label.grid(row=1, column=0, sticky="w", pady=(10, 2))
-        
-        self.frame_rate_var = tk.DoubleVar(value=30.0)
-        frame_rate_scale = ttk.Scale(anim_controls_frame, from_=1, to=60, variable=self.frame_rate_var, 
-                                    orient="horizontal", length=150, command=self.on_frame_rate_change)
-        frame_rate_scale.grid(row=1, column=1, sticky="w", padx=(10, 0))
-        
-        frame_rate_value_label = ttk.Label(anim_controls_frame, textvariable=self.frame_rate_var)
-        frame_rate_value_label.grid(row=1, column=1, sticky="e", padx=(0, 10))
-        
-        # Loop Mode Control (replaced listbox with combobox)
-        loop_mode_label = ttk.Label(anim_controls_frame, text="Loop Mode:")
-        loop_mode_label.grid(row=2, column=0, sticky="w", pady=(10, 2))
-        
-        self.loop_mode_var = tk.StringVar(value="Loop")
-        loop_modes = ["Loop", "Once", "Ping-Pong"]
-        loop_mode_combo = ttk.Combobox(anim_controls_frame, textvariable=self.loop_mode_var, 
-                                      values=loop_modes, width=15, state="readonly")
-        loop_mode_combo.grid(row=2, column=1, sticky="w", padx=(10, 0))
-        loop_mode_combo.bind('<<ComboboxSelected>>', self.on_loop_mode_change)
-        
-        # Playback Direction Control (replaced listbox with combobox)
-        playback_dir_label = ttk.Label(anim_controls_frame, text="Playback Direction:")
-        playback_dir_label.grid(row=3, column=0, sticky="w", pady=(10, 2))
-        
-        self.playback_dir_var = tk.StringVar(value="Forward")
-        playback_dirs = ["Forward", "Reverse"]
-        playback_dir_combo = ttk.Combobox(anim_controls_frame, textvariable=self.playback_dir_var, 
-                                         values=playback_dirs, width=15, state="readonly")
-        playback_dir_combo.grid(row=3, column=1, sticky="w", padx=(10, 0))
-        playback_dir_combo.bind('<<ComboboxSelected>>', self.on_playback_dir_change)
-        
-        # Auto-play Control
-        autoplay_label = ttk.Label(anim_controls_frame, text="Auto-play:")
-        autoplay_label.grid(row=4, column=0, sticky="w", pady=(10, 2))
-        
-        self.autoplay_var = tk.BooleanVar(value=False)
-        autoplay_check = ttk.Checkbutton(anim_controls_frame, text="Enable", variable=self.autoplay_var, 
-                                        command=self.on_autoplay_change)
-        autoplay_check.grid(row=4, column=1, sticky="w", padx=(10, 0))
-        
-        # Animation Progress Control
-        anim_progress_label = ttk.Label(anim_controls_frame, text="Animation Progress:")
-        anim_progress_label.grid(row=5, column=0, sticky="w", pady=(10, 2))
-        
-        self.anim_progress_var = tk.DoubleVar(value=0.0)
-        anim_progress_scale = ttk.Scale(anim_controls_frame, from_=0, to=100, variable=self.anim_progress_var, 
-                                       orient="horizontal", length=150, command=self.on_anim_progress_change)
-        anim_progress_scale.grid(row=5, column=1, sticky="w", padx=(10, 0))
-        
-        anim_progress_value_label = ttk.Label(anim_controls_frame, textvariable=self.anim_progress_var)
-        anim_progress_value_label.grid(row=5, column=1, sticky="e", padx=(0, 10))
-        
-        # Animation Controls Buttons
-        anim_buttons_frame = ttk.Frame(anim_controls_frame)
-        anim_buttons_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(15, 0))
-        anim_buttons_frame.grid_columnconfigure(0, weight=1)
-        anim_buttons_frame.grid_columnconfigure(1, weight=1)
-        anim_buttons_frame.grid_columnconfigure(2, weight=1)
-        anim_buttons_frame.grid_columnconfigure(3, weight=1)
-        
-        play_btn = ttk.Button(anim_buttons_frame, text="Play", command=self.play_3d_animation)
-        play_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        
-        pause_btn = ttk.Button(anim_buttons_frame, text="Pause", command=self.pause_3d_animation)
-        pause_btn.grid(row=0, column=1, sticky="ew", padx=2)
-        
-        stop_btn = ttk.Button(anim_buttons_frame, text="Stop", command=self.stop_3d_animation)
-        stop_btn.grid(row=0, column=2, sticky="ew", padx=2)
-        
-        reset_btn = ttk.Button(anim_buttons_frame, text="Reset", command=self.reset_3d_animation)
-        reset_btn.grid(row=0, column=3, sticky="ew", padx=(5, 0))
-        
-        # Status bar
-        status_frame = ttk.Frame(control_frame)
-        status_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
-        status_frame.grid_columnconfigure(0, weight=1)
-        
-        self.status_bar = ttk.Label(status_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.grid(row=0, column=0, sticky="ew")
-        
-        print("Control panel created with 4 tabs")
+        # (REMOVED DUPLICATE: All controls and buttons in this section are now only inside plot_scrollable_frame)
+        # The following block is intentionally left blank to remove the duplicate controls.
 
     def browse_data_file(self):
         """Browse for data file."""
@@ -4237,6 +4259,595 @@ class StockPredictionGUI:
         except Exception as e:
             print(f"Error resetting 3D animation: {e}")
             self.status_var.set(f"Error resetting animation: {str(e)}")
+
+    def get_help_content(self):
+        """Get the help content for the GUI."""
+        help_text = """
+STOCK PREDICTION GUI - USER MANUAL
+=================================
+
+OVERVIEW
+--------
+The Stock Prediction GUI is a comprehensive neural network application for stock price prediction with advanced visualization capabilities.
+
+Key Features:
+• Neural network training with real-time visualization
+• 3D gradient descent visualization
+• Live training plots with Plotly integration
+• Comprehensive model management
+• Advanced plot controls and animation
+• Prediction capabilities with multiple data sources
+
+INTERFACE OVERVIEW
+------------------
+The GUI consists of two main panels:
+
+1. CONTROL PANEL (Left Side)
+   • Data Selection Tab
+   • Training Parameters Tab
+   • Model Management Tab
+   • Plot Controls Tab
+   • Help Tab (?)
+
+2. DISPLAY PANEL (Right Side)
+   • Training Results Tab
+   • Prediction Results Tab
+   • Gradient Descent Tab
+   • 3D Gradient Descent Tab
+   • Saved Plots Tab
+   • Live Training Plot Tab
+
+USAGE TIPS
+----------
+1. Start by selecting a data file in the Data Selection tab
+2. Configure training parameters in the Training Parameters tab
+3. Click "Start Training" to begin model training
+4. Monitor training progress in the Training Results tab
+5. Use Model Management to make predictions
+6. Explore 3D visualizations in the Plot Controls tab
+
+TROUBLESHOOTING
+---------------
+• If training fails, check data format and feature selection
+• Clear cache if experiencing display issues
+• Ensure sufficient disk space for model saving
+• Check console output for detailed error messages
+
+For more detailed information, use the "Print Full Manual" button.
+"""
+        return help_text
+
+    def print_full_manual(self):
+        """Print the full user manual to console."""
+        try:
+            from STOCK_GUI_USER_MANUAL import StockGUIUserManual
+            manual = StockGUIUserManual()
+            manual.print_full_manual()
+        except ImportError:
+            print("Manual file not found. Printing basic help...")
+            print(self.get_help_content())
+
+    def open_manual_file(self):
+        """Open the manual file in a dedicated window within the GUI."""
+        import os
+        
+        manual_file = os.path.join(os.path.dirname(__file__), "STOCK_GUI_USER_MANUAL.py")
+        
+        if os.path.exists(manual_file):
+            self.show_manual_window(manual_file)
+        else:
+            print(f"Manual file not found at: {manual_file}")
+            # Show basic help in a window instead
+            self.show_manual_window(None)
+
+    def show_manual_window(self, manual_file_path=None):
+        """Show the manual in a dedicated window."""
+        # Create a new top-level window
+        manual_window = tk.Toplevel(self.root)
+        manual_window.title("Stock Prediction GUI - Complete User Manual")
+        manual_window.geometry("800x600")
+        manual_window.configure(bg='white')
+        
+        # Make the window modal (user must close it before using main window)
+        manual_window.transient(self.root)
+        manual_window.grab_set()
+        
+        # Configure grid weights
+        manual_window.grid_columnconfigure(0, weight=1)
+        manual_window.grid_rowconfigure(1, weight=1)
+        
+        # Title frame
+        title_frame = ttk.Frame(manual_window)
+        title_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 5))
+        title_frame.grid_columnconfigure(0, weight=1)
+        
+        title_label = ttk.Label(title_frame, text="Stock Prediction GUI - Complete User Manual", 
+                               font=("Arial", 16, "bold"))
+        title_label.grid(row=0, column=0, sticky="w")
+        
+        # Close button
+        close_btn = ttk.Button(title_frame, text="Close", command=manual_window.destroy)
+        close_btn.grid(row=0, column=1, padx=(10, 0))
+        
+        # Text widget frame
+        text_frame = ttk.Frame(manual_window)
+        text_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        text_frame.grid_columnconfigure(0, weight=1)
+        text_frame.grid_rowconfigure(0, weight=1)
+        
+        # Create text widget with scrollbar - improved configuration
+        text_widget = tk.Text(text_frame, wrap=tk.WORD, font=("Arial", 11), 
+                             bg="white", relief=tk.SUNKEN, padx=10, pady=10,
+                             state=tk.NORMAL)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        text_widget.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        
+        # Get content
+        if manual_file_path:
+            try:
+                # Try to load the actual manual file
+                with open(manual_file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                # Extract the docstring content from the manual file
+                import re
+                docstring_match = re.search(r'"""(.*?)"""', content, re.DOTALL)
+                if docstring_match:
+                    manual_content = docstring_match.group(1).strip()
+                else:
+                    manual_content = content
+                    
+            except Exception as e:
+                print(f"Error reading manual file: {e}")
+                manual_content = self.get_full_manual_content()
+        else:
+            manual_content = self.get_full_manual_content()
+        
+        # Insert content - make sure it's not empty
+        if manual_content.strip():
+            text_widget.insert(tk.END, manual_content)
+            print(f"✅ Manual window: Inserted {len(manual_content)} characters of manual content")
+        else:
+            # Fallback content
+            fallback_content = """
+STOCK PREDICTION GUI - USER MANUAL
+=================================
+
+OVERVIEW
+--------
+The Stock Prediction GUI is a comprehensive neural network application for stock price prediction with advanced visualization capabilities.
+
+Key Features:
+• Neural network training with real-time visualization
+• 3D gradient descent visualization
+• Live training plots with Plotly integration
+• Comprehensive model management
+• Advanced plot controls and animation
+• Prediction capabilities with multiple data sources
+
+INTERFACE OVERVIEW
+------------------
+The GUI consists of two main panels:
+
+1. CONTROL PANEL (Left Side)
+   • Data Selection Tab
+   • Training Parameters Tab
+   • Model Management Tab
+   • Plot Controls Tab
+   • Help Tab (?)
+
+2. DISPLAY PANEL (Right Side)
+   • Training Results Tab
+   • Prediction Results Tab
+   • Gradient Descent Tab
+   • 3D Gradient Descent Tab
+   • Saved Plots Tab
+   • Live Training Plot Tab
+
+USAGE TIPS
+----------
+1. Start by selecting a data file in the Data Selection tab
+2. Configure training parameters in the Training Parameters tab
+3. Click "Start Training" to begin model training
+4. Monitor training progress in the Training Results tab
+5. Use Model Management to make predictions
+6. Explore 3D visualizations in the Plot Controls tab
+
+TROUBLESHOOTING
+---------------
+• If training fails, check data format and feature selection
+• Clear cache if experiencing display issues
+• Ensure sufficient disk space for model saving
+• Check console output for detailed error messages
+
+For more detailed information, use the "Print Full Manual" button.
+"""
+            text_widget.insert(tk.END, fallback_content)
+            print("✅ Manual window: Inserted fallback manual content")
+        
+        # Make read-only after inserting content
+        text_widget.config(state=tk.DISABLED)
+        
+        # Force update to ensure content is displayed
+        text_widget.update()
+        
+        # Focus on the window
+        manual_window.focus_set()
+        
+        # Center the window on screen
+        manual_window.update_idletasks()
+        x = (manual_window.winfo_screenwidth() // 2) - (800 // 2)
+        y = (manual_window.winfo_screenheight() // 2) - (600 // 2)
+        manual_window.geometry(f"800x600+{x}+{y}")
+        
+        # Force update to ensure content is displayed
+        manual_window.update()
+
+    def get_full_manual_content(self):
+        """Get the full manual content as a formatted string."""
+        return """
+STOCK PREDICTION GUI - COMPREHENSIVE USER MANUAL
+===============================================
+
+OVERVIEW
+--------
+The Stock Prediction GUI is a comprehensive neural network application for stock price prediction with advanced visualization capabilities.
+
+Key Features:
+• Neural network training with real-time visualization
+• 3D gradient descent visualization
+• Live training plots with Plotly integration
+• Comprehensive model management
+• Advanced plot controls and animation
+• Prediction capabilities with multiple data sources
+
+INSTALLATION
+------------
+1. Ensure Python 3.8+ is installed
+2. Install required dependencies:
+   pip install tkinter matplotlib numpy pandas scikit-learn plotly
+3. Navigate to the simple directory:
+   cd /path/to/neural_net/simple
+4. Run the GUI:
+   python stock_gui.py
+
+INTERFACE OVERVIEW
+------------------
+The GUI consists of two main panels:
+
+1. CONTROL PANEL (Left Side)
+   • Data Selection Tab
+   • Training Parameters Tab
+   • Model Management Tab
+   • Plot Controls Tab
+   • Help Tab (?)
+
+2. DISPLAY PANEL (Right Side)
+   • Training Results Tab
+   • Prediction Results Tab
+   • Gradient Descent Tab
+   • 3D Gradient Descent Tab
+   • Saved Plots Tab
+   • Live Training Plot Tab
+
+DETAILED TAB GUIDE
+==================
+
+DATA SELECTION TAB
+-----------------
+Location: Control Panel → Data Selection
+
+Features:
+• Data File Selection: Browse and select CSV files with stock data
+• Feature Selection: Multi-select listbox for choosing input features
+• Target Feature: Dropdown to select the target variable (default: close)
+• Output Directory: Choose where to save results
+
+Data File Requirements:
+• CSV format with columns like: open, high, low, close, volume
+• Or generic feature columns: feature_1, feature_2, etc.
+• Minimum 100 rows recommended for training
+
+Feature Selection:
+• Lock Selected: Permanently select specific features
+• Unlock All: Clear feature selection
+• Target Feature: The variable to predict (usually 'close' price)
+
+TRAINING PARAMETERS TAB
+----------------------
+Location: Control Panel → Training Parameters
+
+Model Configuration:
+• Hidden Layer Size: 4-128 neurons (default: 32)
+• Learning Rate: 0.001-0.1 (default: 0.01)
+• Batch Size: 1-512 (default: 32)
+
+Training Process:
+• Start Training: Begin model training process
+• Live Training Plot: Open real-time training visualization
+• Clear Cache: Clear cached data and plots
+
+Training Tips:
+• Start with default parameters for first training
+• Adjust hidden layer size based on data complexity
+• Lower learning rate for more stable training
+• Larger batch sizes for faster training
+
+MODEL MANAGEMENT TAB
+-------------------
+Location: Control Panel → Model Management
+
+Model Operations:
+• Select Model: Choose from trained models in dropdown
+• Refresh Models: Update the model list
+• Make Prediction: Generate predictions with selected model
+
+Prediction Files:
+• View saved prediction results
+• Refresh prediction files list
+• View detailed prediction results
+
+3D Visualization:
+• Create 3D Visualization: Generate 3D gradient descent plots
+• Requires a trained model with saved weights
+
+PLOT CONTROLS TAB
+-----------------
+Location: Control Panel → Plot Controls
+
+3D Visualization Parameters:
+• View Preset: Default, Top View, Side View, Isometric, Front View, Back View
+• Rotation X: -180° to 180° (default: 0°)
+• Rotation Y: -180° to 180° (default: 0°)
+• Rotation Z: -180° to 180° (default: 0°)
+• Zoom Level: 0.1x to 5.0x (default: 1.0x)
+• Camera Position: Adjust 3D camera view (X, Y, Z coordinates)
+
+Animation Controls:
+• Animation Speed: 0.1x to 5.0x (default: 1.0x)
+• Frame Rate: 1 to 60 FPS (default: 30 FPS)
+• Loop Mode: Loop, Once, Ping-Pong (default: Loop)
+• Playback Direction: Forward, Reverse (default: Forward)
+• Auto-play: Enable/disable automatic animation (default: Disabled)
+• Animation Progress: 0% to 100% (default: 0%)
+
+Animation Buttons:
+• Play: Start/resume animation
+• Pause: Pause animation
+• Stop: Stop and reset animation
+• Reset: Reset to beginning
+
+Visualization Parameters:
+• Color Map: Choose from various matplotlib colormaps
+• Point Size: Adjust size of 3D points
+• Line Width: Adjust width of 3D lines
+• Surface Alpha: Transparency of 3D surfaces
+• Grid Points: Number of points for 3D grid
+• Output Resolution: Width and height for saved images
+
+DISPLAY PANEL TABS
+==================
+
+TRAINING RESULTS TAB
+-------------------
+• Real-time training progress display
+• Loss curve visualization
+• Training metrics and statistics
+• Matplotlib toolbar for plot interaction
+
+PREDICTION RESULTS TAB
+---------------------
+• Display prediction results
+• Actual vs Predicted plots
+• Prediction accuracy metrics
+• Export functionality
+
+GRADIENT DESCENT TAB
+-------------------
+• 2D gradient descent visualization
+• Training path visualization
+• Loss surface plots
+• Interactive plot controls
+
+3D GRADIENT DESCENT TAB
+----------------------
+• 3D visualization of gradient descent
+• Interactive 3D controls
+• Animation playback
+• Multiple view presets
+
+SAVED PLOTS TAB
+--------------
+• Browse and view saved plots
+• Plot management
+• Export functionality
+
+LIVE TRAINING PLOT TAB
+---------------------
+• Real-time training visualization
+• Live loss curve updates
+• Training progress monitoring
+
+USAGE WORKFLOW
+==============
+
+Step 1: Data Preparation
+• Select a data file in the Data Selection tab
+• Choose appropriate features for training
+• Set the target feature (usually 'close' price)
+• Select an output directory
+
+Step 2: Model Configuration
+• Configure training parameters in Training Parameters tab
+• Start with default values for first training
+• Adjust parameters based on results
+
+Step 3: Training
+• Click "Start Training" to begin
+• Monitor progress in Training Results tab
+• Use Live Training Plot for real-time monitoring
+
+Step 4: Model Management
+• Select trained model in Model Management tab
+• Make predictions on new data
+• View prediction results and accuracy
+
+Step 5: Visualization
+• Create 3D visualizations in Plot Controls tab
+• Explore different view angles and animations
+• Save plots for later use
+
+TROUBLESHOOTING
+===============
+
+Common Issues:
+
+1. Training Fails
+   • Check data format and feature selection
+   • Ensure sufficient data (minimum 100 rows)
+   • Verify target feature is numeric
+   • Check console output for error messages
+
+2. Display Issues
+   • Clear cache using "Clear Cache" button
+   • Restart the application if needed
+   • Check available system memory
+
+3. 3D Visualization Problems
+   • Ensure model has been trained successfully
+   • Check that 3D visualization files exist
+   • Try different view presets
+
+4. Performance Issues
+   • Reduce batch size for large datasets
+   • Use smaller hidden layer sizes
+   • Clear cache regularly
+
+5. File Not Found Errors
+   • Verify file paths are correct
+   • Check file permissions
+   • Ensure files are in the expected format
+
+KEYBOARD SHORTCUTS
+==================
+• Ctrl+O: Open data file
+• Ctrl+S: Save model
+• Ctrl+P: Make prediction
+• Ctrl+Q: Quit application
+
+ADVANCED FEATURES
+=================
+
+Custom Optimizers:
+• Support for custom optimization algorithms
+• Integration with custom_optimizers module
+• Dynamic optimizer loading
+
+Technical Indicators:
+• Automatic calculation of technical indicators
+• RSI, Moving Averages, Bollinger Bands
+• Custom indicator support
+
+Data Conversion:
+• Automatic data format detection
+• OHLCV format conversion
+• Support for various data sources
+
+Model Persistence:
+• Automatic model saving
+• Training history preservation
+• Scalable model storage
+
+LIMITATIONS
+===========
+• Requires Python 3.8 or higher
+• Limited to tabular data (CSV format)
+• Single target variable prediction
+• No real-time data streaming
+• Memory usage scales with dataset size
+
+FUTURE ENHANCEMENTS
+===================
+• Support for multiple target variables
+• Real-time data integration
+• Advanced model architectures
+• Cloud deployment options
+• Enhanced visualization options
+
+CONTACT AND SUPPORT
+==================
+For issues and questions:
+• Check the console output for error messages
+• Review this manual for troubleshooting
+• Ensure all dependencies are properly installed
+• Verify data format and file paths
+
+Version: 1.0
+Last Updated: 2025-01-27
+"""
+
+    def format_manual_text(self, text_widget):
+        """Apply formatting tags to the manual text."""
+        content = text_widget.get("1.0", tk.END)
+        
+        # Find and tag titles (lines with =)
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            if line.strip().endswith('=') and len(line.strip()) > 3:
+                start = f"{i+1}.0"
+                end = f"{i+1}.end"
+                text_widget.tag_add("title", start, end)
+        
+        # Find and tag section headers (lines with -)
+        for i, line in enumerate(lines):
+            if line.strip().endswith('-') and len(line.strip()) > 3:
+                start = f"{i+1}.0"
+                end = f"{i+1}.end"
+                text_widget.tag_add("section", start, end)
+        
+        # Find and tag subsections (lines with •)
+        for i, line in enumerate(lines):
+            if line.strip().startswith('•'):
+                start = f"{i+1}.0"
+                end = f"{i+1}.end"
+                text_widget.tag_add("subsection", start, end)
+
+    def refresh_color_combobox(self):
+        """Refresh the color combobox to ensure it displays the current value."""
+        try:
+            if hasattr(self, 'color_combo') and self.color_combo:
+                current_color = self.color_var.get()
+                valid_colormaps = ['viridis', 'plasma', 'inferno', 'magma', 'cividis', 'Reds', 'Blues', 'Greens', 'Oranges', 'Purples', 'RdYlBu', 'RdYlGn', 'Spectral', 'coolwarm', 'jet', 'hot', 'gray', 'bone', 'pink', 'spring', 'summer', 'autumn', 'winter']
+                
+                if current_color and current_color in valid_colormaps:
+                    self.color_combo.set(current_color)
+                    print(f"🔄 Refreshed color combobox to: '{current_color}'")
+                else:
+                    self.color_combo.set('viridis')
+                    self.color_var.set('viridis')
+                    print(f"🔄 Reset color combobox to default: 'viridis'")
+                
+                # Force update
+                self.color_combo.update()
+                return True
+        except Exception as e:
+            print(f"❌ Error refreshing color combobox: {e}")
+            return False
+
+    def browse_data_file(self):
+        """Browse for data file."""
+        filename = filedialog.askopenfilename(
+            title="Select Data File",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if filename:
+            self.data_file = filename
+            self.data_file_var.set(filename)
+            self.load_data_features()
+            self.status_var.set(f"Loaded data file: {os.path.basename(filename)}")
 
 # Main execution
 if __name__ == "__main__":
